@@ -21,7 +21,7 @@ Sirius Flash does it the correct way, everywhere: GPT + FAT32 + split `install.w
 - [ ] Rust core: safe device enumeration (by-id / removable / size) — **in progress**
 - [ ] Rust core: Windows-ISO flashing (port of the reference workflow)
 - [ ] Rust core: Linux-ISO image write + verify
-- [ ] Tauri GUI (pick ISO → pick USB → flash)
+- [x] Tauri GUI (pick ISO → pick USB → flash) — dark themed, branded, live log
 - [ ] macOS backend
 - [ ] Windows backend
 - [ ] Signed releases via CI → dl.siriuside.com + AUR
@@ -34,7 +34,7 @@ Every write is gated on hard asserts: target must be **removable**, within a san
 
 ```bash
 cargo build --release        # core + CLI
-# GUI (later): pnpm install && pnpm tauri dev
+cd app && pnpm install && pnpm tauri dev   # launch the GUI
 ```
 
 ## License

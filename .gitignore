@@ -7,3 +7,8 @@ dist/
 src-tauri/gen/
 .env
 *.iso
+# tauri app build artifacts
+app/dist/
+app/node_modules/
+app/src-tauri/target/
+app/src-tauri/gen/

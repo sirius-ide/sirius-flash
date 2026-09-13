@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sirius Flash</title>
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <img class="brand-logo" src="/logo.png" alt="" />
+        <div class="brand-text">
+          <h1>Sirius&nbsp;Flash</h1>
+          <span>Bootable USB creator</span>
+        </div>
+      </header>
+
+      <main class="content">
+        <section class="card">
+          <span class="card-num">1</span>
+          <div class="card-body">
+            <label class="card-label">Disk image</label>
+            <div class="row">
+              <div class="value" id="isoName">No image selected</div>
+              <button class="btn" id="browseBtn">Browse…</button>
+            </div>
+            <div class="meta" id="isoMeta" hidden><span class="chip" id="isoKind"></span></div>
+          </div>
+        </section>
+
+        <section class="card">
+          <span class="card-num">2</span>
+          <div class="card-body">
+            <label class="card-label">Target USB drive</label>
+            <div class="row">
+              <select id="devSelect" class="select"><option value="">Scanning…</option></select>
+              <button class="btn btn-icon" id="refreshBtn" title="Rescan">⟳</button>
+            </div>
+            <div class="hint">Only removable USB drives are shown — internal disks are never listed.</div>
+          </div>
+        </section>
+
+        <section class="card">
+          <span class="card-num">3</span>
+          <div class="card-body">
+            <label class="card-label">Options</label>
+            <div class="opts">
+              <div class="opt"><span>Mode</span><b id="optMode">Auto-detect</b></div>
+              <div class="opt"><span>Scheme</span><b>GPT · UEFI</b></div>
+              <div class="opt"><span>Method</span><b id="optFs">—</b></div>
+            </div>
+          </div>
+        </section>
+
+        <button class="flash-btn" id="flashBtn" disabled>FLASH</button>
+        <p class="warn">⚠ This permanently erases everything on the selected drive.</p>
+
+        <section class="progress" id="progPanel" hidden>
+          <div class="progbar"><div class="progfill" id="progFill"></div></div>
+          <pre class="log" id="log"></pre>
+        </section>
+      </main>
+
+      <footer class="footer">Sirius&nbsp;Flash — part of the Sirius family · GPL-3.0</footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
