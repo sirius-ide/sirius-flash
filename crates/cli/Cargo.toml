@@ -1,0 +1,16 @@
+[package]
+name = "sirius-flash-cli"
+description = "CLI for Sirius Flash — cross-platform bootable USB creator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sirius-flash"
+path = "src/main.rs"
+
+[dependencies]
+sirius-flash-core = { path = "../core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
