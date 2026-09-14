@@ -356,14 +356,14 @@ fn cluster_mask(fs: FileSystem, volume: Volume) -> u32 {
         }
         // 4 KiB to 64 KiB, flat.
         FileSystem::Ntfs => {
-            if size >= 256 * TB {
+            if !(MIN_VOLUME..256 * TB).contains(&size) {
                 return 0;
             }
             0x0001_F000
         }
         // 512 B to 32 MiB, flat.
         FileSystem::ExFat => {
-            if size >= 256 * TB {
+            if !(MIN_VOLUME..256 * TB).contains(&size) {
                 return 0;
             }
             0x03FF_FE00
@@ -387,6 +387,18 @@ fn cluster_mask(fs: FileSystem, volume: Volume) -> u32 {
     }
     allowed
 }
+
+/// Smallest volume we will offer NTFS or exFAT on.
+///
+/// Below this their own structures crowd out the data: a 4 MiB exFAT volume
+/// with a 1 MiB cluster is created happily by `mkfs.exfat` and then rejected by
+/// `fsck.exfat`, which is worse than refusing it. FAT32 has its own, larger
+/// floor of 32 MB built into its mask.
+///
+/// Nothing reachable by flashing comes near this — `assert_safe_target` already
+/// confines real targets to 2–512 GiB — so this only keeps the exploratory
+/// `format-options` output honest.
+const MIN_VOLUME: u64 = 8 * MB;
 
 /// Cluster sizes change slightly above each power-of-two boundary rather than
 /// exactly on it (`FAT32_CLUSTER_THRESHOLD`, `src/rufus.h:116`). Computed in
@@ -1009,5 +1021,31 @@ mod label_tests {
         let (got, _) = sanitise_label(FileSystem::Fat32, &keep);
         assert!(got.is_ascii());
         assert!(got.chars().all(|c| c != '_' || keep.contains('_')));
+    }
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::*;
+
+    /// `mkfs.exfat` will build a 4 MiB volume with a 1 MiB cluster and
+    /// `fsck.exfat` then rejects it, so the model must not offer that pairing.
+    /// Measured, not assumed.
+    #[test]
+    fn filesystems_are_not_offered_below_their_usable_floor() {
+        for fs in [FileSystem::Ntfs, FileSystem::ExFat] {
+            assert!(
+                cluster_sizes(fs, Volume::new(4 * MB, 512)).is_empty(),
+                "{fs} on 4 MiB formats but does not fsck clean"
+            );
+            assert!(
+                !cluster_sizes(fs, Volume::new(8 * MB, 512)).is_empty(),
+                "{fs} is fine from 8 MiB up"
+            );
+        }
+        // Nothing a real target could hit: the safety gate stops well above.
+        for fs in [FileSystem::Ntfs, FileSystem::ExFat, FileSystem::Fat32] {
+            assert!(!cluster_sizes(fs, Volume::new(2 * GB, 512)).is_empty());
+        }
     }
 }
