@@ -79,8 +79,8 @@ Cargo workspace **excludes** `app/` (the Tauri app has its own lockfile; CI audi
 - [x] CI green on Ubuntu / macOS / Windows: fmt, `clippy -D warnings`, tests, release build
 - [x] Security: `cargo audit` on both lockfiles, Dependabot, secret scanning, push protection
 
-**90 tests** (19 in `lib.rs`, 41 in `blockio.rs`, 12 in `lzw.rs`, 13 in `format.rs`,
-5 in the CLI); 83 are
+**96 tests** (19 in `lib.rs`, 42 in `blockio.rs`, 12 in `lzw.rs`, 18 in `format.rs`,
+5 in the CLI); 89 are
 platform-independent — that count is the working proxy for how much of the core is ready
 for the macOS backend.
 
@@ -314,7 +314,7 @@ support · bad-block check.
 
 ```bash
 cargo build --release                       # core + CLI
-cargo test --workspace                      # 90 tests
+cargo test --workspace                      # 96 tests
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 cd app && pnpm install && pnpm tauri dev    # GUI
 ```
