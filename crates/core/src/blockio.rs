@@ -83,6 +83,7 @@ pub enum Compression {
     Bzip2,
     Lzma,
     Zip,
+    Lzw,
 }
 
 impl Compression {
@@ -95,6 +96,7 @@ impl Compression {
             Compression::Bzip2 => "bzip2",
             Compression::Lzma => "lzma",
             Compression::Zip => "zip",
+            Compression::Lzw => "compress",
         }
     }
 
@@ -108,6 +110,8 @@ impl Compression {
             Compression::Zstd
         } else if magic.starts_with(b"BZh") {
             Compression::Bzip2
+        } else if magic.starts_with(&crate::lzw::MAGIC) {
+            Compression::Lzw
         // "PK\x03\x04" is a local file header; "PK\x05\x06" is the end-of-central-
         // directory record an archive with no members starts with. Recognising
         // the second lets us say "this zip is empty" instead of writing the
@@ -369,6 +373,10 @@ pub fn open_image(path: &Path) -> Result<(Box<dyn Read>, u64, Compression, ByteC
         Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(counted)),
         Compression::Xz => Box::new(liblzma::read::XzDecoder::new(counted)),
         Compression::Bzip2 => Box::new(bzip2_rs::DecoderReader::new(counted)),
+        Compression::Lzw => Box::new(
+            crate::lzw::Decoder::new(counted)
+                .map_err(|e| anyhow::anyhow!("not a readable compress (.Z) image: {e}"))?,
+        ),
         // The LZMA-alone container, as produced by `lzma` and `xz --format=lzma`.
         // The memory limit is derived from the dictionary bound that `sniff`
         // already enforces, so a malformed header cannot make liblzma allocate
@@ -882,6 +890,16 @@ mod tests {
         0x00, 0x00, 0x00, 0x00,
     ];
 
+    /// PAYLOAD as a real Unix `compress` archive. Cross-checked against GNU
+    /// `gzip`, which decodes `.Z`, so the fixture cannot quietly agree with a
+    /// bug of our own. The decoder itself is exercised in `crate::lzw`.
+    const DOT_Z: &[u8] = &[
+        0x1f, 0x9d, 0x90, 0x53, 0x92, 0x48, 0x49, 0x52, 0x65, 0x4a, 0x0b, 0x23, 0x4c, 0x82, 0x4c,
+        0x41, 0xd2, 0x62, 0xc8, 0x93, 0x26, 0x50, 0xa4, 0x14, 0x99, 0x12, 0xf0, 0x89, 0x93, 0x16,
+        0x54, 0x26, 0x52, 0x69, 0x01, 0x25, 0x48, 0x16, 0x26, 0x4f, 0x82, 0x10, 0x69, 0x01, 0x23,
+        0x86, 0x8c, 0x19, 0x34, 0x6a, 0xd8, 0xb8, 0x81, 0x23, 0x07,
+    ];
+
     fn roundtrip(tag: &str, blob: &[u8], expect: Compression) {
         let src = tmp(&format!("c-{tag}-src"));
         let dst = tmp(&format!("c-{tag}-dst"));
@@ -947,6 +965,11 @@ mod tests {
         assert_eq!(detect_compression(&src).unwrap(), Compression::Gzip);
         let err = write_image(&src, &dst, &mut noop).unwrap_err();
         assert!(err.to_string().contains("zero bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn decompresses_dot_z() {
+        roundtrip("dotz", DOT_Z, Compression::Lzw);
     }
 
     #[test]
@@ -1023,6 +1046,7 @@ mod tests {
         assert_eq!(Compression::sniff(BZ2), Compression::Bzip2);
         assert_eq!(Compression::sniff(LZMA), Compression::Lzma);
         assert_eq!(Compression::sniff(ZIP), Compression::Zip);
+        assert_eq!(Compression::sniff(DOT_Z), Compression::Lzw);
         assert_eq!(Compression::sniff(b"CD001 plain iso"), Compression::None);
         assert_eq!(Compression::sniff(b""), Compression::None);
     }

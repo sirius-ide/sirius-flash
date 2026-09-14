@@ -40,7 +40,7 @@ fn list_devices() -> Result<Vec<DeviceDto>, String> {
 struct ImageInfo {
     kind: String,
     /// "raw", or the container we will decode on the fly ("gzip", "xz",
-    /// "zstd", "bzip2", "lzma", "zip").
+    /// "zstd", "bzip2", "lzma", "zip", "compress").
     compression: String,
 }
 
