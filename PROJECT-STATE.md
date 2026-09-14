@@ -199,10 +199,37 @@ magic bytes to `sniff()` (or, for a format without a magic number, a positive te
 `detect_compression`), wire a streaming reader into `open_image()`, and test against a
 real fixture archive — never a hand-built byte string.
 
-**Next:** format options (MBR/GPT, BIOS/UEFI target, FAT32/NTFS/exFAT, cluster
-size, volume label, quick format) and the **UEFI:NTFS dual-partition layout** — the latter
-removes WIM splitting entirely and should land together with the options panel, since they
-are one screen in Rufus.
+**Next:** format options (MBR/GPT, BIOS/UEFI target, FAT32/NTFS/exFAT, cluster size,
+volume label, quick format).
+
+The **UEFI:NTFS dual-partition layout** comes after, and the earlier note here claiming it
+"removes WIM splitting entirely" was wrong on both halves. Researched 2026-09-14; keep this
+summary, because the stale version of it is all over the internet.
+
+- It **is** Secure Boot signed, and has been since Rufus 3.17 (2021-10-23). Both the
+  loader (`bootx64.efi`) and the ntfs-3g driver (`ntfs_x64.efi`) carry real Authenticode
+  signatures. Advice saying "disable Secure Boot for UEFI:NTFS" describes the pre-2021
+  GPL-3.0 EfiFs driver and is obsolete.
+- But both chain to **`Microsoft Corporation UEFI CA 2011`** (succeeded by
+  `Microsoft UEFI CA 2023`) — the *third-party* CA, which is **optional**. Microsoft's OEM
+  guidance says OEMs "should consider" shipping it; the mandatory `db` for Windows 11
+  25H2+ contains only `Windows UEFI CA 2023`; and Secured-core PCs must **distrust** it by
+  default. `arm`, `riscv64` and every `exfat_*.efi` are unsigned outright.
+- **When that CA is absent the failure is silent.** The loader and the driver share one
+  signing leaf, so the firmware rejects the loader at `LoadImage` and UEFI:NTFS never runs
+  to print anything. The user sees only `No bootable option or device was found` — the same
+  thing a badly written stick produces. Verified by booting Rufus's exact layout under OVMF
+  across four `db` configurations.
+- **There is therefore no automatic fallback.** The stick is written on one machine for
+  another; the target's `db` is unknowable at flash time, and probing our own would answer
+  about the wrong machine.
+
+So GPT+FAT32+split stays the default: it asks the firmware to trust only the ISO's own
+Microsoft-signed bootloader, a strict subset of what UEFI:NTFS needs. Rufus reached the
+same conclusion and still ships a full WIM splitter at HEAD, keeping FAT32+split behind its
+Alt-E cheat mode. If UEFI:NTFS lands here it is an **opt-in expert option** with a blunt
+in-product warning about the firmware requirement — never a routine layout choice, because
+the bootloader is never given the chance to explain itself.
 
 ## 7. Backlog after that
 
