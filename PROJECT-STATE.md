@@ -47,6 +47,8 @@ crates/core/src/lib.rs      device discovery, safety gate, ISO detection,
                             Windows tweaks + autounattend.xml, both flashers
 crates/core/src/blockio.rs  streaming I/O: progress, SHA-256, verification,
                             format detection + decoding, recursive tree copy
+crates/core/src/format.rs   format options: scheme/target/filesystem/cluster/label,
+                            and the rules that make an illegal combination unusable
 crates/core/src/lzw.rs      streaming Unix compress (.Z) decoder
 crates/core/fixtures/       real binary test archives, with a README on provenance
 crates/cli/src/main.rs      `sirius-flash list | write | unattend`
@@ -77,7 +79,7 @@ Cargo workspace **excludes** `app/` (the Tauri app has its own lockfile; CI audi
 - [x] CI green on Ubuntu / macOS / Windows: fmt, `clippy -D warnings`, tests, release build
 - [x] Security: `cargo audit` on both lockfiles, Dependabot, secret scanning, push protection
 
-**71 tests** (18 in `lib.rs`, 41 in `blockio.rs`, 12 in `lzw.rs`); 65 are
+**83 tests** (18 in `lib.rs`, 41 in `blockio.rs`, 12 in `lzw.rs`, 12 in `format.rs`); 77 are
 platform-independent — that count is the working proxy for how much of the core is ready
 for the macOS backend.
 
@@ -199,8 +201,25 @@ magic bytes to `sniff()` (or, for a format without a magic number, a positive te
 `detect_compression`), wire a streaming reader into `open_image()`, and test against a
 real fixture archive — never a hand-built byte string.
 
-**Next:** format options (MBR/GPT, BIOS/UEFI target, FAT32/NTFS/exFAT, cluster size,
-volume label, quick format).
+**Done:** the format-option *model* — `crates/core/src/format.rs`. A `FormatRequest` is
+what the user asked for and may be nonsense; only `validate()` produces a `FormatPlan`, and
+the flasher will take a plan, so skipping the check is a compile error. Two structural
+tests keep it honest: everything the query functions advertise to a GUI must validate and
+nothing else may, and the advertised sets were run through real `mkfs` (147 plans, all
+accepted).
+
+Two findings worth keeping:
+
+- **MBR above 2 TiB warns, it does not become illegal.** Refusing looks right and is
+  wrong — GPT cannot boot a legacy BIOS either, so rejecting MBR there leaves a BIOS-only
+  image with no legal scheme at all. Rufus only moves the default and asks.
+- **Reimplement Rufus's cluster computation, not the published Microsoft table.** They
+  disagree: on a 256 MB volume the FAT32 default is 512 B, because a default the mask has
+  just excluded is reset to the smallest one still allowed.
+
+**Next:** wire the model into `flash_windows_iso`, which currently hardcodes
+`mklabel gpt` / `mkfs.fat -F 32` / label `WIN11USB`, and expose it in the CLI and GUI.
+Validation must land before `lib.rs`'s "everything from here on is destructive" line.
 
 The **UEFI:NTFS dual-partition layout** comes after, and the earlier note here claiming it
 "removes WIM splitting entirely" was wrong on both halves. Researched 2026-09-14; keep this
@@ -256,7 +275,7 @@ support · bad-block check.
 
 ```bash
 cargo build --release                       # core + CLI
-cargo test --workspace                      # 71 tests
+cargo test --workspace                      # 83 tests
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 cd app && pnpm install && pnpm tauri dev    # GUI
 ```
