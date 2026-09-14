@@ -8,7 +8,7 @@
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -82,6 +82,7 @@ pub enum Compression {
     Zstd,
     Bzip2,
     Lzma,
+    Zip,
 }
 
 impl Compression {
@@ -93,6 +94,7 @@ impl Compression {
             Compression::Zstd => "zstd",
             Compression::Bzip2 => "bzip2",
             Compression::Lzma => "lzma",
+            Compression::Zip => "zip",
         }
     }
 
@@ -106,6 +108,12 @@ impl Compression {
             Compression::Zstd
         } else if magic.starts_with(b"BZh") {
             Compression::Bzip2
+        // "PK\x03\x04" is a local file header; "PK\x05\x06" is the end-of-central-
+        // directory record an archive with no members starts with. Recognising
+        // the second lets us say "this zip is empty" instead of writing the
+        // archive itself to the device.
+        } else if magic.starts_with(b"PK\x03\x04") || magic.starts_with(b"PK\x05\x06") {
+            Compression::Zip
         } else if looks_like_lzma_alone(magic) {
             Compression::Lzma
         } else {
@@ -208,6 +216,21 @@ impl ByteCounter {
     }
 }
 
+/// Either the whole file, or the slice of it holding one zip member.
+enum EitherSource {
+    Whole(File),
+    Member(std::io::Take<File>),
+}
+
+impl Read for EitherSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            EitherSource::Whole(f) => f.read(buf),
+            EitherSource::Member(t) => t.read(buf),
+        }
+    }
+}
+
 struct Counted<R> {
     inner: R,
     counter: ByteCounter,
@@ -221,23 +244,127 @@ impl<R: Read> Read for Counted<R> {
     }
 }
 
+/// Where the payload of the zip member we intend to write actually lives.
+struct ZipMember {
+    /// Byte offset of the member's data, past its local header.
+    data_start: u64,
+    /// Bytes on disk. Doubles as the progress total and as the bound that stops
+    /// a corrupt member from reading into whatever follows it.
+    compressed_size: u64,
+    method: zip::CompressionMethod,
+    name: String,
+}
+
+/// Pick the member to write out of a zip: the largest one, measured
+/// **uncompressed**.
+///
+/// Uncompressed is the size that matters — it is what lands on the device, and
+/// a disk image is nearly always highly compressible, so ranking by compressed
+/// size happily picks a small incompressible README over the 4 GB image next
+/// to it.
+///
+/// The archive is only read to locate the member; it is dropped before any
+/// payload is streamed, which is what keeps the returned reader owned rather
+/// than borrowed from it.
+fn locate_zip_member(path: &Path) -> Result<ZipMember> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| anyhow::anyhow!("not a readable zip image: {e}"))?;
+
+    let mut best: Option<(u64, ZipMember)> = None;
+    for i in 0..archive.len() {
+        let entry = archive
+            .by_index(i)
+            .map_err(|e| anyhow::anyhow!("reading zip entry {i}: {e}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let size = entry.size();
+        if best
+            .as_ref()
+            .is_some_and(|(best_size, _)| size <= *best_size)
+        {
+            continue;
+        }
+        let Some(data_start) = entry.data_start() else {
+            continue;
+        };
+        best = Some((
+            size,
+            ZipMember {
+                data_start,
+                compressed_size: entry.compressed_size(),
+                method: entry.compression(),
+                name: entry.name().to_string(),
+            },
+        ));
+    }
+
+    let Some((_, member)) = best else {
+        bail!(
+            "{} holds no files — an empty zip has no image to write",
+            path.display()
+        );
+    };
+    Ok(member)
+}
+
 /// Open an image for reading, transparently decompressing it.
 ///
 /// Returns the reader, the compressed size on disk, the detected compression,
 /// and a counter tracking consumption of the underlying file.
 pub fn open_image(path: &Path) -> Result<(Box<dyn Read>, u64, Compression, ByteCounter)> {
     let compression = detect_compression(path)?;
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let size = file.metadata()?.len();
+    let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut size = file.metadata()?.len();
     if size == 0 {
         bail!("image {} is empty", path.display());
     }
     let counter = ByteCounter::default();
+
+    // A zip is the one container whose payload does not start at byte zero, so
+    // the file is positioned on the chosen member and bounded to it before the
+    // counter is attached. Progress is then reported against that member rather
+    // than the whole archive, which is what makes it finish at 100%.
+    let mut zip_method = zip::CompressionMethod::Stored;
+    let source = if compression == Compression::Zip {
+        let member = locate_zip_member(path)?;
+        if !matches!(
+            member.method,
+            zip::CompressionMethod::Stored | zip::CompressionMethod::Deflated
+        ) {
+            bail!(
+                "{} in {} is {:?}-compressed, which is not supported inside a zip \
+                 — re-pack it as deflate or store",
+                member.name,
+                path.display(),
+                member.method
+            );
+        }
+        file.seek(SeekFrom::Start(member.data_start))
+            .with_context(|| format!("seeking to {} in {}", member.name, path.display()))?;
+        size = member.compressed_size;
+        zip_method = member.method;
+        // `take` is a bound, not a convenience: without it a member whose length
+        // is understated would keep reading into the next member and the central
+        // directory.
+        EitherSource::Member(file.take(member.compressed_size))
+    } else {
+        EitherSource::Whole(file)
+    };
+
     let counted = Counted {
-        inner: file,
+        inner: source,
         counter: counter.clone(),
     };
+
     let reader: Box<dyn Read> = match compression {
+        Compression::Zip => match zip_method {
+            zip::CompressionMethod::Stored => Box::new(counted),
+            // Zip members hold *raw* deflate, with no zlib wrapper, so this is
+            // DeflateDecoder and never ZlibDecoder.
+            _ => Box::new(flate2::read::DeflateDecoder::new(counted)),
+        },
         Compression::None => Box::new(counted),
         Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(counted)),
         Compression::Xz => Box::new(liblzma::read::XzDecoder::new(counted)),
@@ -695,6 +822,66 @@ mod tests {
         0xa1, 0xe8, 0x92, 0x5a, 0xbb, 0xff, 0xfc, 0xf3, 0x30, 0x00,
     ];
 
+    /// A real `zip` from the system `zip` tool: three stored members, the
+    /// largest of them (`1-image.img`, exactly PAYLOAD) in the middle rather
+    /// than first.
+    const ZIP: &[u8] = &[
+        0x50, 0x4b, 0x03, 0x04, 0x0a, 0x00, 0x02, 0x00, 0x00, 0x00, 0xf2, 0x68, 0x2e, 0x5d, 0x83,
+        0x16, 0xdc, 0x8c, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
+        0x30, 0x2d, 0x74, 0x69, 0x6e, 0x79, 0x2e, 0x74, 0x78, 0x74, 0x78, 0x50, 0x4b, 0x03, 0x04,
+        0x0a, 0x00, 0x02, 0x00, 0x00, 0x00, 0xf2, 0x68, 0x2e, 0x5d, 0xba, 0x2d, 0x30, 0xb2, 0x30,
+        0x00, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x31, 0x2d, 0x69, 0x6d,
+        0x61, 0x67, 0x65, 0x2e, 0x69, 0x6d, 0x67, 0x53, 0x49, 0x52, 0x49, 0x55, 0x53, 0x2d, 0x46,
+        0x4c, 0x41, 0x53, 0x48, 0x2d, 0x43, 0x4f, 0x4d, 0x50, 0x52, 0x45, 0x53, 0x53, 0x49, 0x4f,
+        0x4e, 0x2d, 0x54, 0x45, 0x53, 0x54, 0x2d, 0x50, 0x41, 0x59, 0x4c, 0x4f, 0x41, 0x44, 0x2d,
+        0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x50, 0x4b, 0x03, 0x04, 0x0a,
+        0x00, 0x02, 0x00, 0x00, 0x00, 0xf2, 0x68, 0x2e, 0x5d, 0x8c, 0xa6, 0x1b, 0x01, 0x05, 0x00,
+        0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x32, 0x2d, 0x6e, 0x6f, 0x74,
+        0x65, 0x73, 0x2e, 0x74, 0x78, 0x74, 0x6e, 0x6f, 0x74, 0x65, 0x73, 0x50, 0x4b, 0x01, 0x02,
+        0x1e, 0x03, 0x0a, 0x00, 0x02, 0x00, 0x00, 0x00, 0xf2, 0x68, 0x2e, 0x5d, 0x83, 0x16, 0xdc,
+        0x8c, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xa4, 0x81, 0x00, 0x00, 0x00, 0x00, 0x30, 0x2d, 0x74,
+        0x69, 0x6e, 0x79, 0x2e, 0x74, 0x78, 0x74, 0x50, 0x4b, 0x01, 0x02, 0x1e, 0x03, 0x0a, 0x00,
+        0x02, 0x00, 0x00, 0x00, 0xf2, 0x68, 0x2e, 0x5d, 0xba, 0x2d, 0x30, 0xb2, 0x30, 0x00, 0x00,
+        0x00, 0x30, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0xa4, 0x81, 0x29, 0x00, 0x00, 0x00, 0x31, 0x2d, 0x69, 0x6d, 0x61, 0x67, 0x65,
+        0x2e, 0x69, 0x6d, 0x67, 0x50, 0x4b, 0x01, 0x02, 0x1e, 0x03, 0x0a, 0x00, 0x02, 0x00, 0x00,
+        0x00, 0xf2, 0x68, 0x2e, 0x5d, 0x8c, 0xa6, 0x1b, 0x01, 0x05, 0x00, 0x00, 0x00, 0x05, 0x00,
+        0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xa4,
+        0x81, 0x82, 0x00, 0x00, 0x00, 0x32, 0x2d, 0x6e, 0x6f, 0x74, 0x65, 0x73, 0x2e, 0x74, 0x78,
+        0x74, 0x50, 0x4b, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x03, 0x00, 0xaa, 0x00,
+        0x00, 0x00, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// A real `zip` in which the two ways to rank members disagree:
+    /// `noisy.bin` is 64 incompressible bytes stored as 64, while
+    /// `big-sparse.img` is 4096 zero bytes that deflate down to 20. Ranking by
+    /// compressed size would pick the wrong one, and the winner is deflated,
+    /// so this covers the deflate path and the ranking rule at once.
+    const ZIP_DEFLATED: &[u8] = &[
+        0x50, 0x4b, 0x03, 0x04, 0x0a, 0x00, 0x02, 0x00, 0x00, 0x00, 0xf2, 0x68, 0x2e, 0x5d, 0x4f,
+        0x2e, 0xd3, 0x72, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00,
+        0x6e, 0x6f, 0x69, 0x73, 0x79, 0x2e, 0x62, 0x69, 0x6e, 0x0d, 0xb4, 0x5b, 0x02, 0xa9, 0x50,
+        0xf7, 0x9e, 0x45, 0xec, 0x93, 0x3a, 0xe1, 0x88, 0x2f, 0xd6, 0x7d, 0x24, 0xcb, 0x72, 0x19,
+        0xc0, 0x67, 0x0e, 0xb5, 0x5c, 0x03, 0xaa, 0x51, 0xf8, 0x9f, 0x46, 0xed, 0x94, 0x3b, 0xe2,
+        0x89, 0x30, 0xd7, 0x7e, 0x25, 0xcc, 0x73, 0x1a, 0xc1, 0x68, 0x0f, 0xb6, 0x5d, 0x04, 0xab,
+        0x52, 0xf9, 0xa0, 0x47, 0xee, 0x95, 0x3c, 0xe3, 0x8a, 0x31, 0xd8, 0x7f, 0x26, 0x50, 0x4b,
+        0x03, 0x04, 0x14, 0x00, 0x02, 0x00, 0x08, 0x00, 0xf2, 0x68, 0x2e, 0x5d, 0x11, 0x00, 0x1c,
+        0xc7, 0x14, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x62, 0x69,
+        0x67, 0x2d, 0x73, 0x70, 0x61, 0x72, 0x73, 0x65, 0x2e, 0x69, 0x6d, 0x67, 0xed, 0xc1, 0x01,
+        0x0d, 0x00, 0x00, 0x00, 0xc2, 0xa0, 0xf7, 0x4f, 0x6d, 0x0f, 0x07, 0x14, 0x00, 0x00, 0x00,
+        0xf0, 0x6e, 0x50, 0x4b, 0x01, 0x02, 0x1e, 0x03, 0x0a, 0x00, 0x02, 0x00, 0x00, 0x00, 0xf2,
+        0x68, 0x2e, 0x5d, 0x4f, 0x2e, 0xd3, 0x72, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa4, 0x81, 0x00,
+        0x00, 0x00, 0x00, 0x6e, 0x6f, 0x69, 0x73, 0x79, 0x2e, 0x62, 0x69, 0x6e, 0x50, 0x4b, 0x01,
+        0x02, 0x1e, 0x03, 0x14, 0x00, 0x02, 0x00, 0x08, 0x00, 0xf2, 0x68, 0x2e, 0x5d, 0x11, 0x00,
+        0x1c, 0xc7, 0x14, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa4, 0x81, 0x67, 0x00, 0x00, 0x00, 0x62, 0x69,
+        0x67, 0x2d, 0x73, 0x70, 0x61, 0x72, 0x73, 0x65, 0x2e, 0x69, 0x6d, 0x67, 0x50, 0x4b, 0x05,
+        0x06, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x73, 0x00, 0x00, 0x00, 0xa7, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    ];
+
     fn roundtrip(tag: &str, blob: &[u8], expect: Compression) {
         let src = tmp(&format!("c-{tag}-src"));
         let dst = tmp(&format!("c-{tag}-dst"));
@@ -763,6 +950,66 @@ mod tests {
     }
 
     #[test]
+    fn decompresses_zip_picking_the_largest_member() {
+        roundtrip("zip", ZIP, Compression::Zip);
+    }
+
+    /// The member we write is the largest **uncompressed**, because that is
+    /// what lands on the device. Ranking by compressed size would hand the user
+    /// a 64-byte text file instead of the 4 KiB image beside it — disk images
+    /// compress well, so the real payload is usually the *smallest* member on
+    /// disk.
+    #[test]
+    fn the_largest_member_is_measured_uncompressed() {
+        let src = tmp("zip-rank-src");
+        let dst = tmp("zip-rank-dst");
+        std::fs::write(&src, ZIP_DEFLATED).unwrap();
+        std::fs::write(&dst, b"").unwrap();
+        assert_eq!(detect_compression(&src).unwrap(), Compression::Zip);
+        let o = write_image(&src, &dst, &mut noop).unwrap();
+        assert_eq!(o.bytes_written, 4096, "picked the wrong member");
+        assert_eq!(std::fs::read(&dst).unwrap(), vec![0u8; 4096]);
+        verify_written(&dst, &o.digest, o.bytes_written, &mut noop).unwrap();
+    }
+
+    /// Progress for a zip counts the chosen member, not the whole archive —
+    /// otherwise it would stop short of 100% by however much the other members
+    /// and the central directory weigh.
+    #[test]
+    fn zip_progress_tracks_the_member_not_the_archive() {
+        let src = tmp("zip-prog-src");
+        let dst = tmp("zip-prog-dst");
+        std::fs::write(&src, ZIP_DEFLATED).unwrap();
+        std::fs::write(&dst, b"").unwrap();
+        let mut seen: Vec<Progress> = Vec::new();
+        write_image(&src, &dst, &mut |p| seen.push(p)).unwrap();
+        let last = seen.last().unwrap();
+        assert_eq!(last.bytes, last.total, "must finish at 100%");
+        assert_eq!(last.total, 20, "the deflated member is 20 bytes on disk");
+        assert!(
+            last.total < ZIP_DEFLATED.len() as u64,
+            "the archive is larger than the member; the member is what we track"
+        );
+    }
+
+    #[test]
+    fn an_empty_zip_is_rejected_rather_than_written_raw() {
+        // "PK\x05\x06" — a zip with no members at all. Writing the archive
+        // itself to the device would produce an unbootable stick.
+        let empty: &[u8] = &[
+            0x50, 0x4b, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let src = tmp("zip-empty-src");
+        let dst = tmp("zip-empty-dst");
+        std::fs::write(&src, empty).unwrap();
+        std::fs::write(&dst, b"").unwrap();
+        assert_eq!(detect_compression(&src).unwrap(), Compression::Zip);
+        let err = write_image(&src, &dst, &mut noop).unwrap_err();
+        assert!(err.to_string().contains("no files"), "got: {err}");
+    }
+
+    #[test]
     fn raw_images_are_left_alone() {
         roundtrip("raw", PAYLOAD, Compression::None);
     }
@@ -775,6 +1022,7 @@ mod tests {
         assert_eq!(Compression::sniff(ZST), Compression::Zstd);
         assert_eq!(Compression::sniff(BZ2), Compression::Bzip2);
         assert_eq!(Compression::sniff(LZMA), Compression::Lzma);
+        assert_eq!(Compression::sniff(ZIP), Compression::Zip);
         assert_eq!(Compression::sniff(b"CD001 plain iso"), Compression::None);
         assert_eq!(Compression::sniff(b""), Compression::None);
     }

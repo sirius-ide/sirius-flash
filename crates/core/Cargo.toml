@@ -18,3 +18,7 @@ flate2 = "1"
 ruzstd = "0.7"
 bzip2-rs = "0.1"
 liblzma = { version = "0.4", features = ["static"] }
+# Read-only, and only the two member encodings a disk image ever uses. The
+# umbrella "deflate" feature would also pull in zopfli (a *compressor*) and
+# switch flate2 to a different backend, so name the narrow feature instead.
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
