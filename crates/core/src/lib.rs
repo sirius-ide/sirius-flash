@@ -4,9 +4,17 @@
 //! `/dev/disk/by-id` path, gated on removable + size checks. Kernel names
 //! (`sdb`, `nvme0n1`) are treated as unstable and never trusted for targeting.
 
-use anyhow::{bail, Context, Result};
-use std::fs;
+use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
+
+// Device discovery and flashing are Linux-only for now, so these are too —
+// without the gate they are unused imports on macOS/Windows, which CI's
+// `clippy -D warnings` treats as errors.
+#[cfg(target_os = "linux")]
+use anyhow::Context;
+#[cfg(target_os = "linux")]
+use std::fs;
+#[cfg(target_os = "linux")]
 use std::process::Command;
 
 #[derive(Debug, Clone)]
