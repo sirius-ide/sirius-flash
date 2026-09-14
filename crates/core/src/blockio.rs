@@ -457,6 +457,55 @@ impl<R: Read> Read for Counted<R> {
     }
 }
 
+/// Enforces that a reader yields exactly the number of bytes promised.
+///
+/// A zip's central directory states each member's uncompressed size, and that
+/// is a claim by the archive, not a fact about the data. Deflate reaches about
+/// 1000:1, so a member declaring 4 KiB can expand to gigabytes — and a member
+/// can equally stop short. Neither is detectable from the compressed stream,
+/// and `verify_written` cannot catch either, because the digest is taken over
+/// whatever we actually wrote.
+struct Exact<R> {
+    inner: R,
+    left: u64,
+    total: u64,
+}
+
+impl<R: Read> Read for Exact<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            // Promised length reached: anything still coming means the archive
+            // lied about the size, so stop rather than write it.
+            let mut probe = [0u8; 1];
+            if self.inner.read(&mut probe)? != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "this member expands past the {} bytes its index promised \
+                         — the archive is corrupt or deliberately misdeclared",
+                        self.total
+                    ),
+                ));
+            }
+            return Ok(0);
+        }
+        let cap = buf.len().min(self.left as usize);
+        let n = self.inner.read(&mut buf[..cap])?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "this member ended after {} of the {} bytes its index promised",
+                    self.total - self.left,
+                    self.total
+                ),
+            ));
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
 /// A reader that can hand back one byte it has already taken.
 ///
 /// Needed to tell "the frame ended and the file ended with it" from "another
@@ -562,10 +611,22 @@ struct ZipMember {
     /// a corrupt member from reading into whatever follows it.
     compressed_size: u64,
     method: zip::CompressionMethod,
+    /// What the central directory says the member expands to. Treated as a
+    /// claim to be enforced, not as a fact.
+    uncompressed_size: u64,
     /// Checked because the raw scan below does not decrypt.
     encrypted: bool,
     name: String,
 }
+
+/// Most entries any archive we will look at may hold.
+///
+/// Parsing the index costs a few hundred bytes of memory per entry, and that
+/// happens before a single byte is written. Four million entries is a 340 kB
+/// file that takes 2.4 GB of RAM to open — and an allocation failure aborts the
+/// process rather than returning an error, which in the GUI is a crash. Real
+/// image archives hold a handful of members.
+const MAX_ZIP_ENTRIES: usize = 100_000;
 
 /// Pick the member to write out of a zip: the largest one, measured
 /// **uncompressed**.
@@ -599,12 +660,25 @@ fn locate_zip_member(file: &mut File, path: &Path, file_len: u64) -> Result<ZipM
             path.display()
         );
     }
+    if archive.len() > MAX_ZIP_ENTRIES {
+        bail!(
+            "{} lists {} entries, past the {MAX_ZIP_ENTRIES} we will parse — \
+             an image archive does not hold that many",
+            path.display(),
+            archive.len()
+        );
+    }
 
     let mut best: Option<(u64, ZipMember)> = None;
+    let mut unreadable = 0usize;
     for i in 0..archive.len() {
-        let entry = archive
-            .by_index_raw(i)
-            .map_err(|e| anyhow::anyhow!("reading the index of {}: {e}", path.display()))?;
+        // Deliberately not `?`. Locating an entry parses its local header, so a
+        // single damaged sibling would otherwise veto an archive whose image is
+        // perfectly intact — `unzip -t` reports exactly that split verdict.
+        let Ok(entry) = archive.by_index_raw(i) else {
+            unreadable += 1;
+            continue;
+        };
         if entry.is_dir() {
             continue;
         }
@@ -615,26 +689,30 @@ fn locate_zip_member(file: &mut File, path: &Path, file_len: u64) -> Result<ZipM
         {
             continue;
         }
-        let name = entry.name().to_string();
-        // Absent only if the local header was never located. Skipping the entry
-        // would quietly fall back to a smaller member and write the wrong
-        // payload, so this is fatal.
-        let data_start = entry
-            .data_start()
-            .with_context(|| format!("{name} in {} has no local header", path.display()))?;
+        let Some(data_start) = entry.data_start() else {
+            unreadable += 1;
+            continue;
+        };
         best = Some((
             size,
             ZipMember {
                 data_start,
                 compressed_size: entry.compressed_size(),
+                uncompressed_size: size,
                 method: entry.compression(),
                 encrypted: entry.encrypted(),
-                name,
+                name: entry.name().to_string(),
             },
         ));
     }
 
     let Some((size, member)) = best else {
+        if unreadable > 0 {
+            bail!(
+                "{} has {unreadable} damaged entries and no readable file among them",
+                path.display()
+            );
+        }
         bail!(
             "{} holds only directories — there is no image inside it to write",
             path.display()
@@ -681,6 +759,20 @@ fn locate_zip_member(file: &mut File, path: &Path, file_len: u64) -> Result<ZipM
             path.display()
         );
     }
+    // A stored member is copied verbatim, so its two sizes must agree. There is
+    // no decoder to notice if they do not.
+    if member.method == zip::CompressionMethod::Stored
+        && member.compressed_size != member.uncompressed_size
+    {
+        bail!(
+            "{} in {} is stored uncompressed but declares two different sizes \
+             ({} on disk, {} expanded)",
+            member.name,
+            path.display(),
+            member.compressed_size,
+            member.uncompressed_size
+        );
+    }
     Ok(member)
 }
 
@@ -702,6 +794,7 @@ pub fn open_image(path: &Path) -> Result<(Box<dyn Read>, u64, Compression, ByteC
     // counter is attached. Progress is then reported against that member rather
     // than the whole archive, which is what makes it finish at 100%.
     let mut zip_method = zip::CompressionMethod::Stored;
+    let mut zip_uncompressed = 0u64;
     let source = if compression == Compression::VhdFixed {
         // A fixed VHD is a raw disk image with a 512-byte footer bolted on the
         // end. Writing the footer to the device would append 512 bytes of
@@ -720,6 +813,7 @@ pub fn open_image(path: &Path) -> Result<(Box<dyn Read>, u64, Compression, ByteC
             .with_context(|| format!("seeking to {} in {}", member.name, path.display()))?;
         size = member.compressed_size;
         zip_method = member.method;
+        zip_uncompressed = member.uncompressed_size;
         // `take` is a bound, not a convenience: without it a member whose length
         // is understated would keep reading into the next member and the central
         // directory.
@@ -734,12 +828,19 @@ pub fn open_image(path: &Path) -> Result<(Box<dyn Read>, u64, Compression, ByteC
     };
 
     let reader: Box<dyn Read> = match compression {
-        Compression::Zip => match zip_method {
-            zip::CompressionMethod::Stored => Box::new(counted),
-            // Zip members hold *raw* deflate, with no zlib wrapper, so this is
-            // DeflateDecoder and never ZlibDecoder.
-            _ => Box::new(flate2::read::DeflateDecoder::new(counted)),
-        },
+        Compression::Zip => {
+            let decoded: Box<dyn Read> = match zip_method {
+                zip::CompressionMethod::Stored => Box::new(counted),
+                // Zip members hold *raw* deflate, with no zlib wrapper, so this
+                // is DeflateDecoder and never ZlibDecoder.
+                _ => Box::new(flate2::read::DeflateDecoder::new(counted)),
+            };
+            Box::new(Exact {
+                inner: decoded,
+                left: zip_uncompressed,
+                total: zip_uncompressed,
+            })
+        }
         Compression::None => Box::new(counted),
         Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(counted)),
         // `new_multi_decoder`, not `new`: concatenated .xz streams form a valid
@@ -1795,6 +1896,40 @@ mod tests {
         assert!(Compression::VhdFixed.is_verbatim());
         assert!(Compression::None.is_verbatim());
         assert!(!Compression::Gzip.is_verbatim());
+    }
+
+    /// `unzip -t` reports this archive as "the-image.img OK" and "file #2 bad",
+    /// and so must we. Locating an entry parses its local header, so a scan
+    /// that propagates the first failure lets one damaged sibling veto an
+    /// archive whose image is perfectly intact.
+    #[test]
+    fn a_damaged_sibling_does_not_veto_the_archive() {
+        let src = tmp("zip-badsib-src");
+        let dst = tmp("zip-badsib-dst");
+        std::fs::write(&src, include_bytes!("../fixtures/zip-damaged-sibling.zip")).unwrap();
+        std::fs::write(&dst, b"").unwrap();
+        let o = write_image(&src, &dst, &mut noop).unwrap();
+        assert_eq!(o.bytes_written, 20000);
+        let expected: Vec<u8> = (0..20000).map(|i| ((i * 167 + 13) % 256) as u8).collect();
+        assert_eq!(std::fs::read(&dst).unwrap(), expected);
+    }
+
+    /// A member's uncompressed size is a claim made by the archive, not a fact
+    /// about the data. This one is a real 1 MiB deflate stream declaring 4096
+    /// in both size fields — deflate reaches roughly 1000:1, so the gap can be
+    /// far larger. Writing what actually comes out would overrun the drive, and
+    /// `verify_written` would not notice because the digest covers whatever we
+    /// wrote.
+    #[test]
+    fn a_member_that_outgrows_its_declared_size_is_refused() {
+        let src = tmp("zip-liar-src");
+        let dst = tmp("zip-liar-dst");
+        std::fs::write(&src, include_bytes!("../fixtures/zip-size-misdeclared.zip")).unwrap();
+        std::fs::write(&dst, b"").unwrap();
+        let err = write_image(&src, &dst, &mut noop).unwrap_err();
+        assert!(format!("{err:#}").contains("expands past"), "got: {err:#}");
+        // It stopped at the declared length rather than running on for 1 MiB.
+        assert_eq!(std::fs::read(&dst).unwrap().len(), 4096);
     }
 
     #[test]

@@ -9,6 +9,8 @@ array. Everything here is a **real archive**, not a hand-assembled one.
 | `lzw-dictionary-full.Z` | the same payload at `maxbits=10`, so the dictionary saturates and then stays frozen | as above |
 | `fixed.vhd` | fixed-size VHD: 34816 bytes of payload plus the 512-byte `conectix` footer | `qemu-img convert -f raw -O vpc -o subformat=fixed` |
 | `dynamic.vhd` | dynamic VHD, which we must refuse rather than write | `qemu-img create -f vpc -o subformat=dynamic` |
+| `zip-damaged-sibling.zip` | two real members; the *second* member's local header is clobbered, the first is intact | `zip`, then one byte overwritten |
+| `zip-size-misdeclared.zip` | a genuine deflate member of 1 MiB that declares 4096 in both size fields | `zipfile`, then the size fields rewritten |
 
 The VHDs are files rather than inline arrays because qemu rounds a fixed VHD up
 to CHS geometry, so 35 kB is the smallest one that exists.
