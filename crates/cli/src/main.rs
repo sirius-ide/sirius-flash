@@ -7,7 +7,11 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "sirius-flash", version, about = "Cross-platform bootable USB creator (Sirius Flash)")]
+#[command(
+    name = "sirius-flash",
+    version,
+    about = "Cross-platform bootable USB creator (Sirius Flash)"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -137,7 +141,13 @@ fn main() -> Result<()> {
         Cmd::Unattend { tweaks } => {
             print!("{}", core::generate_autounattend(&tweaks.to_tweaks())?);
         }
-        Cmd::Write { iso, device, kind, yes, tweaks } => {
+        Cmd::Write {
+            iso,
+            device,
+            kind,
+            yes,
+            tweaks,
+        } => {
             if !iso.exists() {
                 bail!("ISO not found: {}", iso.display());
             }
@@ -154,7 +164,12 @@ fn main() -> Result<()> {
             };
 
             let tw = tweaks.to_tweaks();
-            println!("Target : {} ({:.1} GiB, {})", d.dev.display(), d.size_gib(), d.model);
+            println!(
+                "Target : {} ({:.1} GiB, {})",
+                d.dev.display(),
+                d.size_gib(),
+                d.model
+            );
             println!("ISO    : {}", iso.display());
             println!("Kind   : {k:?}");
             if k == core::IsoKind::Windows && !tw.is_noop() {
