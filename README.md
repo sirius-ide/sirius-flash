@@ -26,11 +26,41 @@ Sirius Flash does it the correct way, everywhere: GPT + FAT32 + split `install.w
 - [x] Tauri GUI (pick ISO → pick USB → flash) — dark themed, branded, live progress
 - [ ] Format options: MBR/GPT, BIOS/UEFI, filesystem, cluster size, volume label
 - [ ] UEFI:NTFS dual-partition layout (removes WIM splitting entirely)
-- [x] Compressed images (`.gz` / `.xz` / `.zst` / `.bz2`) — detected by content, streamed
+- [x] Image formats — see the table below; detected by content, streamed, never buffered
 - [ ] Built-in ISO downloader (Linux catalogue, then Windows)
 - [ ] macOS backend
 - [ ] Windows backend
 - [ ] Signed releases via CI → dl.siriuside.com + AUR
+
+## Image formats
+
+Detected by **content**, not by file extension, and streamed — an 8 GB image is
+never held in memory. Concatenated archives (`cat a.gz b.gz`, `pbzip2` output)
+are decoded in full rather than stopping at the first stream.
+
+| Format | Extensions | Notes |
+|---|---|---|
+| Raw | `.iso` `.img` `.usb` `.wic` `.raw` | written verbatim |
+| gzip | `.gz` | multi-member |
+| xz | `.xz` | multi-stream |
+| zstd | `.zst` | multi-frame, large `--long` windows |
+| bzip2 | `.bz2` `.bzip2` | multi-stream, so `pbzip2` output works |
+| LZMA | `.lzma` | headerless: confirmed by a bounded trial decode |
+| Unix compress | `.Z` | LZW, decoder written here |
+| zip | `.zip` | the largest member by uncompressed size |
+| VHD, fixed | `.vhd` | trailing 512-byte footer trimmed |
+
+Not supported yet, and refused with an explanation rather than written wrongly:
+**dynamic** and **differencing** `.vhd` (convert with `qemu-img convert -O vpc
+-o subformat=fixed`), `.vhdx`, `.ffu`, and `.7z`. A zip with a prepended
+self-extracting stub is not recognised as a zip — unpack it first.
+
+**`.vtsi` is deliberately not supported.** Rufus accepts it, but it is a
+proprietary VMware/ThinkPad service-image container with no public
+specification; we would rather say so than pretend.
+
+Every write is hashed with SHA-256 as it goes and read back off the device to
+confirm it — something neither Rufus nor Etcher does.
 
 ## Safety first
 

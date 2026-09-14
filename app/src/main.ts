@@ -114,7 +114,16 @@ $("browseBtn").addEventListener("click", async () => {
   const sel = await open({
     multiple: false,
     filters: [
-      { name: "Disk image", extensions: ["iso", "img", "raw", "gz", "xz", "zst", "bz2", "wic"] },
+      {
+        name: "Disk image",
+        // Mirrors what crates/core/src/blockio.rs can decode. The filter is a
+        // convenience only — detection is by content, so a correctly-formed
+        // image with the wrong extension still works if the user picks it.
+        extensions: [
+          "iso", "img", "raw", "usb", "wic", "vhd",
+          "gz", "xz", "zst", "bz2", "bzip2", "lzma", "Z", "zip",
+        ],
+      },
     ],
   });
   if (!sel || Array.isArray(sel)) return;
@@ -130,17 +139,19 @@ $("browseBtn").addEventListener("click", async () => {
     isoKind = info.kind;
     const win = isoKind === "windows";
     const packed = info.compression !== "raw";
+    // Not all of these are compression — zip and vhd are containers — so the
+    // label names the format rather than asserting what was done to it.
     isoKindEl.textContent = win
       ? "Windows installer"
       : packed
-        ? `Compressed image (${info.compression})`
+        ? `Disk image (${info.compression})`
         : "Linux / other ISO";
     isoKindEl.className = "chip " + (win ? "chip-win" : "chip-lin");
     optMode.textContent = win ? "Windows" : "Linux / direct";
     optFs.textContent = win
       ? "FAT32 + WIM split"
       : packed
-        ? "Decompress + write"
+        ? "Unpack + write"
         : "Direct image write";
     // The Windows tweaks only apply to a Windows installer.
     wueCard.hidden = !win;
