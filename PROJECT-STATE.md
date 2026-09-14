@@ -79,7 +79,7 @@ Cargo workspace **excludes** `app/` (the Tauri app has its own lockfile; CI audi
 - [x] CI green on Ubuntu / macOS / Windows: fmt, `clippy -D warnings`, tests, release build
 - [x] Security: `cargo audit` on both lockfiles, Dependabot, secret scanning, push protection
 
-**99 tests** (20 in `lib.rs`, 42 in `blockio.rs`, 12 in `lzw.rs`, 20 in `format.rs`,
+**101 tests** (22 in `lib.rs`, 42 in `blockio.rs`, 12 in `lzw.rs`, 20 in `format.rs`,
 5 in the CLI); 92 are
 platform-independent — that count is the working proxy for how much of the core is ready
 for the macOS backend.
@@ -249,45 +249,36 @@ written is what actually does that, and it already runs by default.
   not boot-verified. See the note on verification below.
 - **UEFI:NTFS**, per the §6 note above: opt-in expert option or not at all.
 
-### A limitation worth knowing before promising boot fixes
+### Boot testing: possible here, today, with no root and no mtools
 
-**We cannot boot-test our own media on this machine.** Loop devices need root (denied) and
-`mtools` is absent, so there is no way to write files into a partitioned FAT32 image
-locally. QEMU and OVMF *are* available and were used to verify the UEFI:NTFS Secure Boot
-behaviour — but that test used a pre-built image rather than one we formatted.
+An earlier version of this section said we could not boot-test locally, because loop
+devices need root and `mtools` is absent. **That was wrong**, and the mistake mattered —
+it was being used to argue boot-sector work could not be verified.
 
-Any change to the boot path — BIOS boot sectors above all — therefore needs either root on
-a test box, `mtools` installed, or real hardware. Until then, refusing an unverified layout
-is the honest option, which is why MBR + UEFI is declined rather than assumed.
+The blocker is removed by one flag:
 
-The **UEFI:NTFS dual-partition layout** comes after, and the earlier note here claiming it
-"removes WIM splitting entirely" was wrong on both halves. Researched 2026-09-14; keep this
-summary, because the stale version of it is all over the internet.
+| tool | role |
+|---|---|
+| `sfdisk` | partitions a **plain file**, unprivileged — no loop device |
+| `mkfs.fat --offset=SECTOR` | creates FAT32 *inside* the image at the partition offset. **This is what loop devices were needed for.** `-h`, `-s`, `-R`, `-b`, `-D` set every BPB field boot code reads |
+| `python3` | ~40 lines writes a file into the FAT (BPB, FAT chain in both copies, 8.3 root entry, cluster data) — replaces `mcopy` |
+| `qemu-system-x86_64` + SeaBIOS | boots it under TCG, so no KVM and no root; works in a CI container |
+| `nasm` / `ndisasm` | build boot sectors, and disassemble Rufus's blobs to compare |
 
-- It **is** Secure Boot signed, and has been since Rufus 3.17 (2021-10-23). Both the
-  loader (`bootx64.efi`) and the ntfs-3g driver (`ntfs_x64.efi`) carry real Authenticode
-  signatures. Advice saying "disable Secure Boot for UEFI:NTFS" describes the pre-2021
-  GPL-3.0 EfiFs driver and is obsolete.
-- But both chain to **`Microsoft Corporation UEFI CA 2011`** (succeeded by
-  `Microsoft UEFI CA 2023`) — the *third-party* CA, which is **optional**. Microsoft's OEM
-  guidance says OEMs "should consider" shipping it; the mandatory `db` for Windows 11
-  25H2+ contains only `Windows UEFI CA 2023`; and Secured-core PCs must **distrust** it by
-  default. `arm`, `riscv64` and every `exfat_*.efi` are unsigned outright.
-- **When that CA is absent the failure is silent.** The loader and the driver share one
-  signing leaf, so the firmware rejects the loader at `LoadImage` and UEFI:NTFS never runs
-  to print anything. The user sees only `No bootable option or device was found` — the same
-  thing a badly written stick produces. Verified by booting Rufus's exact layout under OVMF
-  across four `db` configurations.
-- **There is therefore no automatic fallback.** The stick is written on one machine for
-  another; the target's `db` is unknowable at flash time, and probing our own would answer
-  about the wrong machine.
+Output is read without a display by dumping the VGA text buffer from the qemu monitor —
+`memsave 0xb8000 4000` — and decoding the 80x25 char/attr pairs. Deterministic and
+greppable; no screenshots.
 
-So GPT+FAT32+split stays the default: it asks the firmware to trust only the ISO's own
-Microsoft-signed bootloader, a strict subset of what UEFI:NTFS needs. Rufus reached the
-same conclusion and still ships a full WIM splitter at HEAD, keeping FAT32+split behind its
-Alt-E cheat mode. If UEFI:NTFS lands here it is an **opt-in expert option** with a blunt
-in-product warning about the firmware requirement — never a routine layout choice, because
-the bootloader is never given the chance to explain itself.
+Verified here: `sfdisk` + `mkfs.fat --offset=2048` on a 64 MiB file produces a bootable-flagged
+type-0x0c entry at LBA 2048 and a valid VBR with the right label, entirely unprivileged.
+
+Demonstrated on the same harness: media with **no** boot code — which is what this build
+produces for an MBR+BIOS target — gives `Booting from Hard Disk...` and then silence. The
+silent dead stick §4 warns about, reproducible in seconds.
+
+So testability is **not** a reason to defer boot-sector work. The reasons that remain are
+the provenance question below and the fact that the blobs need per-volume BPB patching
+rather than being copied verbatim.
 
 ## 7. Backlog after that
 
@@ -314,7 +305,7 @@ support · bad-block check.
 
 ```bash
 cargo build --release                       # core + CLI
-cargo test --workspace                      # 99 tests
+cargo test --workspace                      # 101 tests
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 cd app && pnpm install && pnpm tauri dev    # GUI
 ```
