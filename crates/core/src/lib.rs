@@ -581,14 +581,74 @@ fn pick_install_image(sources_dir: &Path) -> Option<(String, u64)> {
 /// `tweaks`, when present, is written to the USB as `autounattend.xml` — this is
 /// what bypasses the Windows 11 TPM / Secure Boot / RAM checks and the
 /// Microsoft-account requirement.
+/// What this build can actually turn into bootable Windows media.
+///
+/// The options model in [`format`] describes the whole of Rufus's panel; this
+/// is the corner of it we can produce media for today. Anything outside it is
+/// refused here rather than formatted into a drive that silently will not boot.
+#[cfg(target_os = "linux")]
+fn assert_buildable(plan: &format::FormatPlan) -> Result<()> {
+    if plan.needs_boot_code() {
+        bail!(
+            "a {} target needs an MBR bootstrap and a partition boot record, which this \
+             build does not write yet — the drive would format and then not boot. Target \
+             UEFI instead.",
+            plan.target().as_str()
+        );
+    }
+    if plan.filesystem() != format::FileSystem::Fat32 {
+        bail!(
+            "Windows installation media must be FAT32 here: UEFI firmware is only obliged \
+             to read FAT, and booting {} would need an NTFS driver loaded first",
+            plan.filesystem()
+        );
+    }
+    if plan.scheme() != format::PartitionScheme::Gpt {
+        // MBR + UEFI + FAT32 is a real and common layout, but we have no way to
+        // boot-test it here, and an unverified boot path is how a user ends up
+        // with media that formats cleanly and does nothing.
+        bail!(
+            "only GPT is supported for Windows media so far; MBR with a UEFI target is \
+             valid but is not yet verified here"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 pub fn flash_windows_iso(
     d: &UsbDevice,
     iso: &Path,
     tweaks: Option<&WindowsTweaks>,
+    format: Option<&format::FormatPlan>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<()> {
     assert_safe_target(d)?;
+
+    // Everything about the format is settled here, while the drive is still
+    // intact — invariant 1. A plan we cannot build must fail now, not after
+    // `parted` has run.
+    let default_plan;
+    let plan = match format {
+        Some(p) => p,
+        None => {
+            default_plan = format::FormatRequest {
+                scheme: format::PartitionScheme::Gpt,
+                target: format::TargetSystem::Uefi,
+                filesystem: format::FileSystem::Fat32,
+                cluster_size: None,
+                label: "WIN11USB".into(),
+                quick: true,
+            }
+            .validate(format::Volume::new(d.size_bytes, 512))?;
+            &default_plan
+        }
+    };
+    assert_buildable(plan)?;
+    for w in plan.warnings() {
+        println!("note: {w}");
+    }
+
     let dev = d.by_id.to_string_lossy().to_string();
     let part1 = format!("{dev}-part1");
 
@@ -626,7 +686,16 @@ pub fn flash_windows_iso(
             ],
         )?;
         run("udevadm", &["settle"])?;
-        run("mkfs.fat", &["-F", "32", "-n", "WIN11USB", &part1])?;
+        // `-s` is sectors per cluster, not bytes.
+        let spc = (plan.cluster_size() / plan.volume().sector_size).to_string();
+        let mut mkfs = vec!["-F", "32", "-s", &spc, "-n", plan.label()];
+        if !plan.quick() {
+            // Read every sector looking for bad ones. This is how a counterfeit
+            // or dying stick is caught before an image is trusted to it.
+            mkfs.push("-c");
+        }
+        mkfs.push(&part1);
+        run("mkfs.fat", &mkfs)?;
         run("mount", &[&part1, usb_mnt])?;
 
         // FAT32 cannot store a file of 4 GiB or more, so an oversized install
@@ -757,6 +826,7 @@ pub fn flash_windows_iso(
     _d: &UsbDevice,
     _iso: &Path,
     _tweaks: Option<&WindowsTweaks>,
+    _format: Option<&format::FormatPlan>,
     _on_progress: &mut dyn FnMut(Progress),
 ) -> Result<()> {
     bail!("Windows-ISO flashing not yet implemented on this OS")
@@ -955,6 +1025,61 @@ mod tests {
         // Must be detectable BEFORE partitioning, so the drive survives.
         let d = scratch_sources("none", &[("boot.wim", 3)]);
         assert_eq!(pick_install_image(&d), None);
+    }
+
+    // ---- what the flasher can actually build ----
+
+    #[cfg(target_os = "linux")]
+    fn plan(
+        scheme: format::PartitionScheme,
+        target: format::TargetSystem,
+        fs: format::FileSystem,
+    ) -> format::FormatPlan {
+        format::FormatRequest {
+            scheme,
+            target,
+            filesystem: fs,
+            cluster_size: None,
+            label: "SIRIUS".into(),
+            quick: true,
+        }
+        .validate(format::Volume::new(32 * 1024 * 1024 * 1024, 512))
+        .expect("the combination itself is legal")
+    }
+
+    /// The options model describes more than we can build, deliberately. Every
+    /// gap has to be refused here, because each one would otherwise format
+    /// cleanly and hand the user media that does not boot — with no error at
+    /// any point to say why.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn combinations_we_cannot_build_are_refused_by_name() {
+        use format::*;
+        // Legal, and the path that ships.
+        assert_buildable(&plan(
+            PartitionScheme::Gpt,
+            TargetSystem::Uefi,
+            FileSystem::Fat32,
+        ))
+        .expect("GPT + UEFI + FAT32 is what we already make");
+
+        // BIOS needs boot code we do not write.
+        let err = assert_buildable(&plan(
+            PartitionScheme::Mbr,
+            TargetSystem::Bios,
+            FileSystem::Fat32,
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("MBR bootstrap"), "got: {err}");
+
+        // MBR + UEFI is a real layout but is not boot-verified here.
+        let err = assert_buildable(&plan(
+            PartitionScheme::Mbr,
+            TargetSystem::Uefi,
+            FileSystem::Fat32,
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("not yet verified"), "got: {err}");
     }
 
     #[test]

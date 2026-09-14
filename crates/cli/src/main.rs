@@ -40,6 +40,8 @@ enum Cmd {
         no_verify: bool,
         #[command(flatten)]
         tweaks: TweakArgs,
+        #[command(flatten)]
+        format: FormatArgs,
     },
     /// Print the autounattend.xml the given tweaks would produce (writes nothing)
     Unattend {
@@ -59,6 +61,62 @@ enum Cmd {
         #[arg(long, default_value = "512")]
         sector_size: u32,
     },
+}
+
+/// How the target should be partitioned and formatted. Only meaningful for a
+/// Windows ISO, which is the path that creates a filesystem; a raw image brings
+/// its own partition table and is written byte for byte.
+#[derive(clap::Args, Clone)]
+struct FormatArgs {
+    /// Volume label (FAT32 keeps 11 characters and uppercases them)
+    #[arg(long, value_name = "LABEL", help_heading = "Format options")]
+    label: Option<String>,
+    /// Cluster size, e.g. 4096, 4K or 32K (default: best for the drive size)
+    #[arg(long, value_name = "SIZE", help_heading = "Format options")]
+    cluster_size: Option<String>,
+    /// Read every sector while formatting, to catch a counterfeit or dying stick
+    #[arg(long, help_heading = "Format options")]
+    full_format: bool,
+}
+
+/// "32K" / "4096" -> bytes.
+fn parse_cluster_size(s: &str) -> Result<u32> {
+    let t = s.trim();
+    let (digits, mult) = match t.chars().last() {
+        Some('K') | Some('k') => (&t[..t.len() - 1], 1024),
+        Some('M') | Some('m') => (&t[..t.len() - 1], 1024 * 1024),
+        _ => (t, 1),
+    };
+    let n: u32 = digits
+        .parse()
+        .map_err(|_| anyhow!("{s:?} is not a cluster size; try 4096, 4K or 32K"))?;
+    n.checked_mul(mult)
+        .ok_or_else(|| anyhow!("{s:?} is too large to be a cluster size"))
+}
+
+impl FormatArgs {
+    /// Turn the flags into a checked plan for this drive, or `None` to let the
+    /// core pick its defaults.
+    fn to_plan(&self, device_size: u64) -> Result<Option<core::format::FormatPlan>> {
+        if self.label.is_none() && self.cluster_size.is_none() && !self.full_format {
+            return Ok(None);
+        }
+        let cluster_size = match &self.cluster_size {
+            Some(c) => Some(parse_cluster_size(c)?),
+            None => None,
+        };
+        let request = core::format::FormatRequest {
+            scheme: core::format::PartitionScheme::Gpt,
+            target: core::format::TargetSystem::Uefi,
+            filesystem: core::format::FileSystem::Fat32,
+            cluster_size,
+            label: self.label.clone().unwrap_or_else(|| "WIN11USB".into()),
+            quick: !self.full_format,
+        };
+        Ok(Some(
+            request.validate(core::format::Volume::new(device_size, 512))?,
+        ))
+    }
 }
 
 /// Print every legal combination for a drive, and say which of them this
@@ -302,6 +360,7 @@ fn main() -> Result<()> {
             yes,
             no_verify,
             tweaks,
+            format,
         } => {
             if !iso.exists() {
                 bail!("ISO not found: {}", iso.display());
@@ -346,7 +405,14 @@ fn main() -> Result<()> {
 
             match k {
                 core::IsoKind::Windows => {
-                    core::flash_windows_iso(&d, &iso, Some(&tw), &mut print_progress)?;
+                    let plan = format.to_plan(d.size_bytes)?;
+                    core::flash_windows_iso(
+                        &d,
+                        &iso,
+                        Some(&tw),
+                        plan.as_ref(),
+                        &mut print_progress,
+                    )?;
                     println!();
                 }
                 core::IsoKind::Other => {
@@ -358,4 +424,69 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cluster_sizes_parse_with_and_without_a_suffix() {
+        assert_eq!(parse_cluster_size("4096").unwrap(), 4096);
+        assert_eq!(parse_cluster_size("4K").unwrap(), 4096);
+        assert_eq!(parse_cluster_size("32k").unwrap(), 32768);
+        assert_eq!(parse_cluster_size("1M").unwrap(), 1024 * 1024);
+        assert_eq!(parse_cluster_size(" 8K ").unwrap(), 8192);
+    }
+
+    #[test]
+    fn a_cluster_size_that_is_not_a_size_is_rejected() {
+        for bad in ["", "K", "4G", "-1", "4.5K", "lots"] {
+            assert!(
+                parse_cluster_size(bad).is_err(),
+                "{bad:?} should not parse as a cluster size"
+            );
+        }
+    }
+
+    /// No format flags means no plan, so the core keeps its own defaults rather
+    /// than having them restated — and wrongly — in two places.
+    #[test]
+    fn absent_format_flags_leave_the_core_to_decide() {
+        let args = FormatArgs {
+            label: None,
+            cluster_size: None,
+            full_format: false,
+        };
+        assert!(args.to_plan(32 * 1024 * 1024 * 1024).unwrap().is_none());
+    }
+
+    #[test]
+    fn format_flags_become_a_checked_plan() {
+        let args = FormatArgs {
+            label: Some("my install".into()),
+            cluster_size: Some("32K".into()),
+            full_format: true,
+        };
+        let plan = args
+            .to_plan(32 * 1024 * 1024 * 1024)
+            .unwrap()
+            .expect("flags were given");
+        assert_eq!(plan.cluster_size(), 32768);
+        assert_eq!(plan.label(), "MY INSTALL", "FAT32 uppercases and trims");
+        assert!(!plan.quick(), "--full-format asks for the slow one");
+    }
+
+    /// A cluster size the drive cannot take is refused here, before anything is
+    /// written, and the message names the sizes that would work.
+    #[test]
+    fn an_impossible_cluster_size_fails_before_the_drive_is_touched() {
+        let args = FormatArgs {
+            label: None,
+            cluster_size: Some("512".into()),
+            full_format: false,
+        };
+        let err = args.to_plan(32 * 1024 * 1024 * 1024).unwrap_err();
+        assert!(err.to_string().contains("16 KB"), "got: {err}");
+    }
 }

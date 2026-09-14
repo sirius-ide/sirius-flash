@@ -79,7 +79,8 @@ Cargo workspace **excludes** `app/` (the Tauri app has its own lockfile; CI audi
 - [x] CI green on Ubuntu / macOS / Windows: fmt, `clippy -D warnings`, tests, release build
 - [x] Security: `cargo audit` on both lockfiles, Dependabot, secret scanning, push protection
 
-**84 tests** (18 in `lib.rs`, 41 in `blockio.rs`, 12 in `lzw.rs`, 13 in `format.rs`); 78 are
+**90 tests** (19 in `lib.rs`, 41 in `blockio.rs`, 12 in `lzw.rs`, 13 in `format.rs`,
+5 in the CLI); 83 are
 platform-independent — that count is the working proxy for how much of the core is ready
 for the macOS backend.
 
@@ -228,14 +229,34 @@ marks the difference and the flasher must honour it:
   `write_ntfs_br`). **We write none of it.** Formatting for BIOS would succeed and hand the
   user a drive that silently does not boot — so it must be refused, not attempted.
 
-**Next:** expose the model read-only first (a `format-options` subcommand that prints the
-legal sets for a device, mirroring how `unattend` prints without writing), then wire it into
-`flash_windows_iso` for the UEFI subset only. That function currently hardcodes
-`mklabel gpt` / `mkfs.fat -F 32` / label `WIN11USB`, and validation must land before its
-"everything from here on is destructive" line (`lib.rs:611`).
+`sirius-flash format-options` prints the legal sets for a drive (or a hypothetical
+`--size-gb`) and writes nothing, and `write` takes `--label`, `--cluster-size` and
+`--full-format`. `flash_windows_iso` now takes a validated plan, resolved and checked
+*before* its "everything from here on is destructive" line, and `assert_buildable` refuses
+anything outside GPT + UEFI + FAT32 by name.
 
-Writing BIOS boot sectors is its own piece of work, and is what would unlock MBR/BIOS
-targets and NTFS-for-BIOS.
+**`--full-format` is not cosmetic**: it passes `-c` to `mkfs.fat`, which reads every sector
+looking for bad ones. That is how a counterfeit or dying stick is caught before an image is
+trusted to it.
+
+**Next, and needing a decision:**
+
+- **BIOS boot sectors.** The larger half of Rufus's panel does nothing until we write an
+  MBR bootstrap and partition boot records. Its own phase, not a tack-on.
+- **MBR + UEFI + FAT32** is a real, common layout we currently refuse only because it is
+  not boot-verified. See the note on verification below.
+- **UEFI:NTFS**, per the §6 note above: opt-in expert option or not at all.
+
+### A limitation worth knowing before promising boot fixes
+
+**We cannot boot-test our own media on this machine.** Loop devices need root (denied) and
+`mtools` is absent, so there is no way to write files into a partitioned FAT32 image
+locally. QEMU and OVMF *are* available and were used to verify the UEFI:NTFS Secure Boot
+behaviour — but that test used a pre-built image rather than one we formatted.
+
+Any change to the boot path — BIOS boot sectors above all — therefore needs either root on
+a test box, `mtools` installed, or real hardware. Until then, refusing an unverified layout
+is the honest option, which is why MBR + UEFI is declined rather than assumed.
 
 The **UEFI:NTFS dual-partition layout** comes after, and the earlier note here claiming it
 "removes WIM splitting entirely" was wrong on both halves. Researched 2026-09-14; keep this
@@ -291,7 +312,7 @@ support · bad-block check.
 
 ```bash
 cargo build --release                       # core + CLI
-cargo test --workspace                      # 84 tests
+cargo test --workspace                      # 90 tests
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 cd app && pnpm install && pnpm tauri dev    # GUI
 ```
