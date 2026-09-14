@@ -122,7 +122,10 @@ impl Compression {
             Compression::Zstd
         } else if magic.starts_with(b"BZh") {
             Compression::Bzip2
-        } else if magic.starts_with(&crate::lzw::MAGIC) {
+        } else if magic.len() >= 3
+            && magic[..2] == crate::lzw::MAGIC
+            && crate::lzw::flags_valid(magic[2])
+        {
             Compression::Lzw
         // "PK\x03\x04" is a local file header; "PK\x05\x06" is the end-of-central-
         // directory record an archive with no members starts with. Recognising
@@ -180,8 +183,7 @@ fn looks_like_lzma_alone(magic: &[u8]) -> bool {
     if magic.len() < 13 {
         return false;
     }
-    // (pb * 5 + lp) * 9 + lc, with lc < 9, lp < 5, pb < 5.
-    if magic[0] >= 225 {
+    if !lzma_props_valid(magic[0]) {
         return false;
     }
     // Rules out every all-zero header — ISO9660, ext4, MBR and GPT images all
@@ -196,6 +198,25 @@ fn looks_like_lzma_alone(magic: &[u8]) -> bool {
         magic[5], magic[6], magic[7], magic[8], magic[9], magic[10], magic[11], magic[12],
     ]);
     uncompressed == u64::MAX || uncompressed <= MAX_PLAUSIBLE_IMAGE
+}
+
+/// Is this a properties byte the LZMA-alone format can actually produce?
+///
+/// The byte packs three parameters as `(pb * 5 + lp) * 9 + lc`. Bounding it at
+/// 224 only checks that they unpack, but the alone format additionally requires
+/// `lc + lp <= 4`, which leaves 75 of the 256 values legal and caps the byte at
+/// 216. The difference is not academic: Chromium's `.pak` resource files and
+/// SciPy's MATLAB v4 `.mat` files both start with a byte that unpacks and is
+/// not legal.
+fn lzma_props_valid(props: u8) -> bool {
+    if props > 216 {
+        return false;
+    }
+    let lc = props % 9;
+    let rest = props / 9;
+    let lp = rest % 5;
+    let pb = rest / 5;
+    pb <= 4 && lc + lp <= 4
 }
 
 /// How much output a trial decode asks for before believing a file is LZMA.
@@ -357,6 +378,28 @@ fn vhd_footer(f: &mut File, file_size: u64) -> Result<Option<VhdFooter>> {
     Ok(VhdFooter::parse_tail(&tail, file_size))
 }
 
+/// Refuse a VHD we cannot write, naming what it is.
+///
+/// Called at image-selection time, so the user hears about it before a target
+/// device has been chosen, let alone wiped.
+fn reject_unwritable_vhd(path: &Path, disk_type: u32) -> Result<()> {
+    match disk_type {
+        VhdFooter::DYNAMIC => bail!(
+            "{} is a dynamic VHD, which stores its data in scattered blocks. \
+             Only fixed-size VHDs can be written so far — convert it with \
+             `qemu-img convert -O vpc -o subformat=fixed`",
+            path.display()
+        ),
+        VhdFooter::DIFFERENCING => bail!(
+            "{} is a differencing VHD, which holds only the changes against a \
+             parent disk and cannot be written on its own",
+            path.display()
+        ),
+        VhdFooter::FIXED => Ok(()),
+        other => bail!("{} is a VHD of unsupported type {other}", path.display()),
+    }
+}
+
 /// Detect how `path` is encoded.
 ///
 /// Layered, and the order is load-bearing. A real magic number wins outright.
@@ -376,26 +419,25 @@ pub fn detect_compression(path: &Path) -> Result<Compression> {
     }
 
     let file_size = f.metadata()?.len();
+    // Dynamic and differencing VHDs mirror their footer at offset 0 for
+    // redundancy, and a fixed one never does. Checking the head copy as well as
+    // the tail catches one whose tail is missing or truncated, which would
+    // otherwise look like a raw image and be written block-table and all.
+    if n >= 8 && magic[..8] == *VhdFooter::COOKIE {
+        let mut head_copy = [0u8; 512];
+        f.rewind()?;
+        read_full(&mut f, &mut head_copy)?;
+        if let Some(footer) = VhdFooter::parse_tail(&head_copy, file_size) {
+            reject_unwritable_vhd(path, footer.disk_type)?;
+        }
+    }
     if let Some(footer) = vhd_footer(&mut f, file_size)
         .with_context(|| format!("reading the trailer of {}", path.display()))?
     {
-        return match footer.disk_type {
-            VhdFooter::FIXED => Ok(Compression::VhdFixed),
-            // Refused here, at image-selection time, rather than after a target
-            // device has been chosen and wiped.
-            VhdFooter::DYNAMIC => bail!(
-                "{} is a dynamic VHD, which stores its data in scattered blocks. \
-                 Only fixed-size VHDs can be written so far — convert it with \
-                 `qemu-img convert -O vpc -o subformat=fixed`",
-                path.display()
-            ),
-            VhdFooter::DIFFERENCING => bail!(
-                "{} is a differencing VHD, which holds only the changes against \
-                 a parent disk and cannot be written on its own",
-                path.display()
-            ),
-            other => bail!("{} is a VHD of unsupported type {other}", path.display()),
-        };
+        if footer.disk_type == VhdFooter::FIXED {
+            return Ok(Compression::VhdFixed);
+        }
+        reject_unwritable_vhd(path, footer.disk_type)?;
     }
 
     // Last, because it is the only format without a magic number and so the
@@ -1930,6 +1972,34 @@ mod tests {
         assert!(format!("{err:#}").contains("expands past"), "got: {err:#}");
         // It stopped at the declared length rather than running on for 1 MiB.
         assert_eq!(std::fs::read(&dst).unwrap().len(), 4096);
+    }
+
+    /// The properties byte packs `(pb * 5 + lp) * 9 + lc`, but the alone format
+    /// also requires `lc + lp <= 4`. Bounding it at 224 — enough for the three
+    /// fields to unpack — lets through bytes no encoder emits, and real files
+    /// sit on them: Chromium's `.pak` resources start 0x05.
+    #[test]
+    fn only_genuine_lzma_property_bytes_are_accepted() {
+        let legal: Vec<u8> = (0..=255u8).filter(|b| lzma_props_valid(*b)).collect();
+        assert_eq!(legal.len(), 75, "the alone format permits exactly 75");
+        assert_eq!(*legal.iter().max().unwrap(), 216);
+        // lc=3, lp=0, pb=2 — what `lzma` and `xz --format=lzma` write.
+        assert!(lzma_props_valid(0x5d));
+        assert!(!lzma_props_valid(0x05), "chromium .pak starts with this");
+        assert!(!lzma_props_valid(224), "unpacks, but lc + lp exceeds 4");
+    }
+
+    /// A dynamic or differencing VHD mirrors its footer at offset 0; a fixed one
+    /// never does. Checking the head copy as well as the tail catches one whose
+    /// footer is missing, which would otherwise read as a raw image and be
+    /// written to the device block-allocation table and all.
+    #[test]
+    fn a_dynamic_vhd_is_refused_even_with_its_footer_gone() {
+        let whole = include_bytes!("../fixtures/dynamic.vhd");
+        let src = tmp("vhd-dyntrunc-src");
+        std::fs::write(&src, &whole[..whole.len() - 512]).unwrap();
+        let err = detect_compression(&src).unwrap_err();
+        assert!(err.to_string().contains("dynamic VHD"), "got: {err}");
     }
 
     #[test]

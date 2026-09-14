@@ -25,6 +25,16 @@ use std::io::{self, BufReader, Read};
 /// `1f 9d`, the same two bytes `file(1)` keys on.
 pub const MAGIC: [u8; 2] = [0x1f, 0x9d];
 
+/// Is this a flags byte `compress` could have written?
+///
+/// Low five bits are the maximum code width, bit 7 is block mode, and bits 5
+/// and 6 are reserved and always zero. Checking all three turns the two-byte
+/// magic into roughly twenty bits of evidence, which matters because `1f 9d` on
+/// its own is only as strong as a coin landing the same way sixteen times.
+pub fn flags_valid(flags: u8) -> bool {
+    flags & 0x60 == 0 && (INIT_WIDTH..=MAX_WIDTH).contains(&u32::from(flags & 0x1f))
+}
+
 /// Codes always start nine bits wide.
 const INIT_WIDTH: u32 = 9;
 
@@ -152,13 +162,23 @@ impl<R: Read> Decoder<R> {
                 "not a compress (.Z) stream",
             ));
         }
-        let max_width = u32::from(header[2] & 0x1f);
-        if !(INIT_WIDTH..=MAX_WIDTH).contains(&max_width) {
+        if !flags_valid(header[2]) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsupported .Z code width {max_width}, expected 9 to 16"),
+                format!(
+                    "unusable .Z flags byte {:#04x}: code width {} (expected 9 to 16), \
+                     reserved bits {}",
+                    header[2],
+                    header[2] & 0x1f,
+                    if header[2] & 0x60 == 0 {
+                        "clear"
+                    } else {
+                        "set"
+                    }
+                ),
             ));
         }
+        let max_width = u32::from(header[2] & 0x1f);
         let block_mode = header[2] & 0x80 != 0;
         let capacity = 1usize << max_width;
         Ok(Decoder {
@@ -422,12 +442,26 @@ mod tests {
     #[test]
     fn rejects_an_impossible_code_width() {
         // The low five bits hold the width; 8 and 17 are both out of range.
-        for flags in [0x88u8, 0x91] {
+        // The last has bit 5 set, which is reserved and always zero.
+        for flags in [0x88u8, 0x91, 0x30] {
             let err = Decoder::new(&[0x1f, 0x9d, flags][..])
                 .err()
-                .unwrap_or_else(|| panic!("width {} must be rejected", flags & 0x1f));
+                .unwrap_or_else(|| panic!("flags {flags:#04x} must be rejected"));
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         }
+    }
+
+    /// `1f 9d` alone is two bytes of evidence, which a raw disk image can hit
+    /// by chance. The flags byte carries the rest: a width of 9 to 16 and two
+    /// reserved bits that are always clear.
+    #[test]
+    fn the_flags_byte_carries_most_of_the_evidence() {
+        let accepted = (0..=255u8).filter(|f| flags_valid(*f)).count();
+        assert_eq!(accepted, 16, "8 widths, each with block mode on or off");
+        assert!(flags_valid(0x90), "maxbits 16, block mode — the usual case");
+        assert!(flags_valid(0x10), "maxbits 16, block mode off");
+        assert!(!flags_valid(0x9f), "width 31 does not exist");
+        assert!(!flags_valid(0xb0), "reserved bit 5 set");
     }
 
     #[test]
