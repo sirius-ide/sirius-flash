@@ -74,13 +74,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "bzip2-rs"
-version = "0.1.2"
+name = "bzip2"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "beeb59e7e4c811ab37cc73680c798c7a5da77fc9989c62b09138e31ee740f735"
+checksum = "f3a53fac24f34a81bc9954b5d6cfce0c21e18ec6959f44f56e8e90e4bb7c346c"
 dependencies = [
- "crc32fast",
- "tinyvec",
+ "libbz2-rs-sys",
 ]
 
 [[package]]
@@ -273,6 +272,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libbz2-rs-sys"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34b357333733e8260735ba5894eb928c02ecc69c78715f01a8019e7fa7f2db4c"
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -396,7 +401,7 @@ name = "sirius-flash-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bzip2-rs",
+ "bzip2",
  "flate2",
  "liblzma",
  "ruzstd",
@@ -420,12 +425,6 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
-
-[[package]]
-name = "tinyvec"
-version = "1.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "twox-hash"

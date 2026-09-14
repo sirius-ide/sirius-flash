@@ -11,14 +11,19 @@ anyhow = "1"
 sha2 = "0.11"
 
 # Streaming decompressors. All must stream: a disk image can be 8 GB+, so
-# decoding into memory is not an option. flate2/ruzstd/bzip2-rs are pure Rust;
-# liblzma is built statically from bundled source so there is no system
-# dependency on any platform.
+# decoding into memory is not an option. flate2, ruzstd and bzip2 are pure Rust
+# -- bzip2's default backend is libbz2-rs-sys, a Rust reimplementation rather
+# than the C library -- and liblzma is built statically from bundled source, so
+# there is no system dependency on any platform.
+#
+# Each must also handle *concatenated* streams, which every reference tool
+# unpacks in full: hence MultiGzDecoder, XzDecoder::new_multi_decoder,
+# MultiBzDecoder, and our own frame loop for zstd.
 flate2 = "1"
 ruzstd = "0.9"
-bzip2-rs = "0.1"
 liblzma = { version = "0.4", features = ["static"] }
 # Read-only, and only the two member encodings a disk image ever uses. The
 # umbrella "deflate" feature would also pull in zopfli (a *compressor*) and
 # switch flate2 to a different backend, so name the narrow feature instead.
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+bzip2 = "0.6"
