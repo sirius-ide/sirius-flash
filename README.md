@@ -18,10 +18,16 @@ Sirius Flash does it the correct way, everywhere: GPT + FAT32 + split `install.w
 🚧 Early development. Linux core first (productized from a proven shell workflow), then macOS, then Windows.
 
 - [x] Reference Linux workflow (`scripts/make-win11-usb.sh`) — GPT+FAT32+wimsplit, by-id safety asserts
-- [ ] Rust core: safe device enumeration (by-id / removable / size) — **in progress**
-- [ ] Rust core: Windows-ISO flashing (port of the reference workflow)
-- [ ] Rust core: Linux-ISO image write + verify
-- [x] Tauri GUI (pick ISO → pick USB → flash) — dark themed, branded, live log
+- [x] Rust core: safe device enumeration (by-id / removable / size)
+- [x] Rust core: Windows-ISO flashing (UDF-aware detection, install.wim/.esd, FAT32 split)
+- [x] Rust core: image write + SHA-256 + read-back verification, in-process (no `dd`)
+- [x] Windows 11 User Experience — bypass TPM / Secure Boot / RAM / CPU / storage,
+      skip the Microsoft account, local admin, no data collection, debloat
+- [x] Tauri GUI (pick ISO → pick USB → flash) — dark themed, branded, live progress
+- [ ] Format options: MBR/GPT, BIOS/UEFI, filesystem, cluster size, volume label
+- [ ] UEFI:NTFS dual-partition layout (removes WIM splitting entirely)
+- [ ] Compressed images (`.gz` / `.xz` / `.zst` / `.bz2`)
+- [ ] Built-in ISO downloader (Linux catalogue, then Windows)
 - [ ] macOS backend
 - [ ] Windows backend
 - [ ] Signed releases via CI → dl.siriuside.com + AUR

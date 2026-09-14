@@ -580,7 +580,12 @@ fn pick_install_image(sources_dir: &Path) -> Option<(String, u64)> {
 /// what bypasses the Windows 11 TPM / Secure Boot / RAM checks and the
 /// Microsoft-account requirement.
 #[cfg(target_os = "linux")]
-pub fn flash_windows_iso(d: &UsbDevice, iso: &Path, tweaks: Option<&WindowsTweaks>) -> Result<()> {
+pub fn flash_windows_iso(
+    d: &UsbDevice,
+    iso: &Path,
+    tweaks: Option<&WindowsTweaks>,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<()> {
     assert_safe_target(d)?;
     let dev = d.by_id.to_string_lossy().to_string();
     let part1 = format!("{dev}-part1");
@@ -626,17 +631,15 @@ pub fn flash_windows_iso(d: &UsbDevice, iso: &Path, tweaks: Option<&WindowsTweak
         // image is split into .swm chunks; a smaller one is copied as-is.
         const FAT32_MAX_FILE: u64 = 4 * 1024 * 1024 * 1024 - 1;
         let split = img_size > FAT32_MAX_FILE;
-        let exclude = format!("--exclude=sources/{install_img}");
-        let mut rsync_args = vec!["-rt", "--no-perms", "--no-owner", "--no-group"];
-        if split {
-            rsync_args.push(&exclude);
-        }
-        let from = format!("{iso_mnt}/");
-        let to = format!("{usb_mnt}/");
-        rsync_args.push(&from);
-        rsync_args.push(&to);
+        // When the image is too big for FAT32 it is left out of the copy and
+        // split into .swm chunks afterwards instead.
+        let exclude: Vec<String> = if split {
+            vec![format!("sources/{install_img}")]
+        } else {
+            Vec::new()
+        };
         println!(
-            "Copying ISO contents ({install_img}, {} MiB — {})...",
+            "Copying ISO contents ({install_img}, {} MiB — {})",
             img_size / 1024 / 1024,
             if split {
                 "will be split for FAT32"
@@ -644,7 +647,12 @@ pub fn flash_windows_iso(d: &UsbDevice, iso: &Path, tweaks: Option<&WindowsTweak
                 "fits FAT32, copied whole"
             }
         );
-        run("rsync", &rsync_args)?;
+        blockio::copy_tree(
+            Path::new(iso_mnt),
+            Path::new(usb_mnt),
+            &exclude,
+            on_progress,
+        )?;
         if split {
             run(
                 "wimlib-imagex",
@@ -734,6 +742,7 @@ pub fn flash_windows_iso(
     _d: &UsbDevice,
     _iso: &Path,
     _tweaks: Option<&WindowsTweaks>,
+    _on_progress: &mut dyn FnMut(Progress),
 ) -> Result<()> {
     bail!("Windows-ISO flashing not yet implemented on this OS")
 }

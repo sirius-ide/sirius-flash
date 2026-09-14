@@ -235,7 +235,10 @@ fn main() -> Result<()> {
             }
 
             match k {
-                core::IsoKind::Windows => core::flash_windows_iso(&d, &iso, Some(&tw))?,
+                core::IsoKind::Windows => {
+                    core::flash_windows_iso(&d, &iso, Some(&tw), &mut print_progress)?;
+                    println!();
+                }
                 core::IsoKind::Other => {
                     core::flash_linux_iso(&d, &iso, !no_verify, &mut print_progress)?;
                     println!();

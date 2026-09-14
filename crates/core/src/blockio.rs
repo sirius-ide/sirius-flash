@@ -7,9 +7,9 @@
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// 4 MiB: large enough to keep USB writes near line rate, small enough that
@@ -25,6 +25,7 @@ const TICK: Duration = Duration::from_millis(250);
 pub enum Stage {
     Write,
     Verify,
+    Copy,
 }
 
 impl Stage {
@@ -32,6 +33,7 @@ impl Stage {
         match self {
             Stage::Write => "write",
             Stage::Verify => "verify",
+            Stage::Copy => "copy",
         }
     }
 }
@@ -192,6 +194,116 @@ fn drop_cache(dest: &Path) {
 #[cfg(not(target_os = "linux"))]
 fn drop_cache(_dest: &Path) {}
 
+/// Does `rel` name exactly this excluded path? Compared case-insensitively,
+/// because ISO9660 and UDF disagree about the case of the same filename.
+fn excluded(rel: &Path, exclude: &[String]) -> bool {
+    let r = rel.to_string_lossy().replace('\\', "/").to_lowercase();
+    exclude.iter().any(|e| e.to_lowercase() == r)
+}
+
+/// Every regular file under `root` (relative paths), the directories that hold
+/// them, and the total byte count — so progress can be a real percentage
+/// rather than a spinner.
+#[allow(clippy::type_complexity)]
+fn collect_tree(
+    root: &Path,
+    exclude: &[String],
+) -> Result<(Vec<PathBuf>, Vec<(PathBuf, u64)>, u64)> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut files: Vec<(PathBuf, u64)> = Vec::new();
+    let mut total = 0u64;
+    let mut stack = vec![PathBuf::new()];
+
+    while let Some(rel_dir) = stack.pop() {
+        let abs = root.join(&rel_dir);
+        for entry in fs::read_dir(&abs).with_context(|| format!("reading {}", abs.display()))? {
+            let entry = entry?;
+            let rel = rel_dir.join(entry.file_name());
+            if excluded(&rel, exclude) {
+                continue;
+            }
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                dirs.push(rel.clone());
+                stack.push(rel);
+            } else if ft.is_file() {
+                let len = entry.metadata()?.len();
+                total += len;
+                files.push((rel, len));
+            }
+            // Symlinks are skipped on purpose: FAT32 cannot represent them and
+            // Windows install media does not use them.
+        }
+    }
+    Ok((dirs, files, total))
+}
+
+/// Recursively copy `src` into `dst`, skipping `exclude` (paths relative to
+/// `src`, e.g. `sources/install.wim`), reporting progress as it goes.
+///
+/// Replaces `rsync`, which reported nothing without `--info=progress2` and left
+/// the flagship Windows path looking frozen for minutes. Ownership and
+/// permissions are deliberately not preserved — the destination is FAT32,
+/// which cannot store them.
+pub fn copy_tree(
+    src: &Path,
+    dst: &Path,
+    exclude: &[String],
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<u64> {
+    let (dirs, files, total) = collect_tree(src, exclude)?;
+    for d in &dirs {
+        fs::create_dir_all(dst.join(d))
+            .with_context(|| format!("creating {}", dst.join(d).display()))?;
+    }
+
+    let mut buf = vec![0u8; BUF_SIZE];
+    let mut done = 0u64;
+    let started = Instant::now();
+    let mut last_tick = Instant::now();
+    let mut tick = |done: u64, force: bool, on: &mut dyn FnMut(Progress)| {
+        if force || last_tick.elapsed() >= TICK {
+            let secs = started.elapsed().as_secs_f64();
+            on(Progress {
+                stage: Stage::Copy,
+                bytes: done,
+                total,
+                bytes_per_sec: if secs > 0.0 {
+                    (done as f64 / secs) as u64
+                } else {
+                    0
+                },
+            });
+            last_tick = Instant::now();
+        }
+    };
+
+    for (rel, _) in &files {
+        let from = src.join(rel);
+        let to = dst.join(rel);
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut r = File::open(&from).with_context(|| format!("reading {}", from.display()))?;
+        let mut w = File::create(&to).with_context(|| format!("writing {}", to.display()))?;
+        loop {
+            let n = r
+                .read(&mut buf)
+                .with_context(|| format!("reading {}", from.display()))?;
+            if n == 0 {
+                break;
+            }
+            w.write_all(&buf[..n])
+                .with_context(|| format!("writing {}", to.display()))?;
+            done += n as u64;
+            tick(done, false, on_progress);
+        }
+        w.flush()?;
+    }
+    tick(done, true, on_progress);
+    Ok(done)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +371,73 @@ mod tests {
         verify_written(&dst, &d, last.total, &mut |p| vseen.push(p)).unwrap();
         assert_eq!(vseen.last().unwrap().stage, Stage::Verify);
         assert_eq!(vseen.last().unwrap().bytes, last.total);
+    }
+
+    // ---- copy_tree ----
+
+    fn tree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("sirius-copytree-{tag}"));
+        let _ = std::fs::remove_dir_all(&base);
+        let (src, dst) = (base.join("src"), base.join("dst"));
+        std::fs::create_dir_all(src.join("sources")).unwrap();
+        std::fs::create_dir_all(src.join("efi/boot")).unwrap();
+        std::fs::create_dir_all(src.join("empty")).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("setup.exe"), vec![1u8; 100]).unwrap();
+        std::fs::write(src.join("sources/install.wim"), vec![2u8; 500]).unwrap();
+        std::fs::write(src.join("sources/boot.wim"), vec![3u8; 50]).unwrap();
+        std::fs::write(src.join("efi/boot/bootx64.efi"), vec![4u8; 25]).unwrap();
+        (src, dst)
+    }
+
+    #[test]
+    fn copies_a_nested_tree_including_empty_dirs() {
+        let (src, dst) = tree("all");
+        let copied = copy_tree(&src, &dst, &[], &mut noop).unwrap();
+        assert_eq!(copied, 100 + 500 + 50 + 25);
+        assert_eq!(
+            std::fs::read(dst.join("sources/install.wim"))
+                .unwrap()
+                .len(),
+            500
+        );
+        assert_eq!(
+            std::fs::read(dst.join("efi/boot/bootx64.efi"))
+                .unwrap()
+                .len(),
+            25
+        );
+        assert!(dst.join("empty").is_dir(), "empty directories must survive");
+    }
+
+    #[test]
+    fn exclusion_skips_the_named_file_only() {
+        let (src, dst) = tree("excl");
+        let copied = copy_tree(&src, &dst, &["sources/install.wim".into()], &mut noop).unwrap();
+        assert_eq!(copied, 100 + 50 + 25, "excluded bytes must not be counted");
+        assert!(!dst.join("sources/install.wim").exists());
+        // Its siblings and directory must still be there.
+        assert!(dst.join("sources/boot.wim").exists());
+    }
+
+    #[test]
+    fn exclusion_is_case_insensitive() {
+        // ISO9660 often uppercases what UDF stores in lowercase, so a
+        // case-sensitive match would copy a 7 GB image we meant to split.
+        let (src, dst) = tree("case");
+        copy_tree(&src, &dst, &["SOURCES/INSTALL.WIM".into()], &mut noop).unwrap();
+        assert!(!dst.join("sources/install.wim").exists());
+    }
+
+    #[test]
+    fn copy_progress_ends_at_the_measured_total() {
+        let (src, dst) = tree("prog");
+        let mut seen: Vec<Progress> = Vec::new();
+        copy_tree(&src, &dst, &[], &mut |p| seen.push(p)).unwrap();
+        let last = seen.last().expect("a final progress report");
+        assert_eq!(last.stage, Stage::Copy);
+        assert_eq!(last.bytes, last.total);
+        assert_eq!(last.total, 675);
     }
 
     #[test]
