@@ -30,6 +30,12 @@ secrets.*
 *.esd
 *.swm
 
+# …except test fixtures: small, and the tests will not compile without them.
+# The rules above are extension-wide, so a fixture lands in .gitignore's lap the
+# moment it is named after the format it tests. `git add -A` skips ignored files
+# without a word, so this went unnoticed until a clean checkout failed to build.
+!crates/core/fixtures/**
+
 # Editor / OS local state
 .vscode/
 .idea/
