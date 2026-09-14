@@ -31,6 +31,15 @@ pub struct UsbDevice {
     pub model: String,
     pub size_bytes: u64,
     pub removable: bool,
+    /// Logical sector size as the device reports it — 512 almost everywhere,
+    /// 4096 on 4Kn media.
+    ///
+    /// Not cosmetic. A cluster is counted in sectors, so `mkfs.fat -s` means
+    /// "this many sectors", and assuming 512 on a 4Kn drive formats with
+    /// clusters eight times the size the plan chose. That can drive the
+    /// cluster count below FAT32's 65,525 minimum, at which point firmware
+    /// refuses to read the volume and the stick does not boot.
+    pub sector_size: u32,
 }
 
 impl UsbDevice {
@@ -447,7 +456,10 @@ pub fn list_removable_devices() -> Result<Vec<UsbDevice>> {
         };
         let sys = Path::new("/sys/block").join(&base);
         let removable = read_u64(&sys.join("removable")).unwrap_or(0) == 1;
+        // `size` is in 512-byte units whatever the logical block size is, so
+        // this stays x512 even on 4Kn media.
         let size_bytes = read_u64(&sys.join("size")).unwrap_or(0) * 512;
+        let sector_size = read_u64(&sys.join("queue/logical_block_size")).unwrap_or(512) as u32;
         let model = fs::read_to_string(sys.join("device/model"))
             .unwrap_or_default()
             .trim()
@@ -458,6 +470,7 @@ pub fn list_removable_devices() -> Result<Vec<UsbDevice>> {
             model,
             size_bytes,
             removable,
+            sector_size,
         });
     }
     out.sort_by(|a, b| a.by_id.cmp(&b.by_id));
@@ -640,10 +653,21 @@ pub fn flash_windows_iso(
                 label: "WIN11USB".into(),
                 quick: true,
             }
-            .validate(format::Volume::new(d.size_bytes, 512))?;
+            .validate(format::Volume::new(d.size_bytes, d.sector_size))?;
             &default_plan
         }
     };
+    // A plan is proof that a combination is valid — for the drive it was
+    // checked against. It carries that drive's geometry, so a plan built
+    // elsewhere would silently format with the wrong cluster arithmetic.
+    if plan.volume().sector_size != d.sector_size {
+        bail!(
+            "this format plan was checked against {} byte sectors but {} reports {}",
+            plan.volume().sector_size,
+            d.dev.display(),
+            d.sector_size
+        );
+    }
     assert_buildable(plan)?;
     for w in plan.warnings() {
         println!("note: {w}");
@@ -669,6 +693,30 @@ pub fn flash_windows_iso(
         }
     };
 
+    // Does it fit? The filesystem goes on partition 1, which starts 1 MiB in,
+    // and FAT32's own tables cost a little more on top. Checking this after the
+    // wipe — which is where it used to happen, implicitly, when the copy ran
+    // out of room — leaves the user with an erased drive and a half-written
+    // installer. Invariant 1.
+    //
+    // The contents are measured whole, including any install image that will be
+    // split: splitting turns one oversized file into `.swm` chunks of much the
+    // same total size, so it saves no space at all.
+    let content_bytes = blockio::tree_size(Path::new(iso_mnt))?;
+    const PARTITION_START: u64 = 1024 * 1024;
+    // FAT32 metadata is roughly 0.1% of the volume; 1% is a safe margin that
+    // still refuses only genuinely hopeless cases.
+    let usable = (d.size_bytes.saturating_sub(PARTITION_START) as f64 * 0.99) as u64;
+    if content_bytes > usable {
+        let _ = Command::new("umount").arg(iso_mnt).status();
+        bail!(
+            "this image needs {:.1} GiB but {} holds about {:.1} GiB once formatted",
+            content_bytes as f64 / 1024.0_f64.powi(3),
+            d.dev.display(),
+            usable as f64 / 1024.0_f64.powi(3)
+        );
+    }
+
     // ---- everything from here on is destructive ----
     let _ = Command::new("bash")
         .arg("-c")
@@ -690,8 +738,12 @@ pub fn flash_windows_iso(
         let spc = (plan.cluster_size() / plan.volume().sector_size).to_string();
         let mut mkfs = vec!["-F", "32", "-s", &spc, "-n", plan.label()];
         if !plan.quick() {
-            // Read every sector looking for bad ones. This is how a counterfeit
-            // or dying stick is caught before an image is trusted to it.
+            // `-c` reads every sector and marks the unreadable ones bad. It is
+            // read-only — it writes no pattern and reads none back — so it
+            // finds a failing stick but NOT a fake-capacity counterfeit, whose
+            // unwritten sectors read back fine and whose writes wrap silently.
+            // Catching those needs a write-and-verify pass, which read-back
+            // verification after the image is written already does.
             mkfs.push("-c");
         }
         mkfs.push(&part1);
@@ -852,6 +904,7 @@ mod tests {
             model: "big".into(),
             size_bytes: 8_000_000_000_000,
             removable: false,
+            sector_size: 512,
         };
         assert!(assert_safe_target(&d).is_err());
     }
@@ -863,6 +916,7 @@ mod tests {
             model: "big".into(),
             size_bytes: 8_000_000_000_000,
             removable: true,
+            sector_size: 512,
         };
         assert!(assert_safe_target(&d).is_err());
     }
@@ -874,6 +928,7 @@ mod tests {
             model: "DataTraveler".into(),
             size_bytes: 62_000_000_000,
             removable: true,
+            sector_size: 512,
         };
         assert!(assert_safe_target(&d).is_ok());
     }

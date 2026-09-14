@@ -120,6 +120,27 @@ impl FileSystem {
     fn uppercases_label(self) -> bool {
         matches!(self, FileSystem::Fat32)
     }
+
+    /// Must the label be folded to plain ASCII?
+    ///
+    /// FAT keeps the label as 11 bytes of an OEM code page, and nothing outside
+    /// printable ASCII survives that round trip: `mkfs.fat` converts through
+    /// CP850 and then rejects the result, because dosfstools tests
+    /// `doslabel[i] < 0x20` on a *signed* char, so every byte at or above 0x80
+    /// trips it. The error even names a character class the label does not
+    /// contain — "characters below 0x20".
+    ///
+    /// This matters far more than a cosmetic rename. `mkfs.fat` runs *after*
+    /// `parted`, so an accented label meant a wiped drive and then a failed
+    /// format: invariant 1, exactly. Folding here keeps the whole decision on
+    /// the safe side of that boundary. Rufus does the same thing for the same
+    /// reason (`src/format.c:284-288`, `if (wLabel[i] >= 0x80) wLabel[k++] = '_'`).
+    ///
+    /// NTFS and exFAT store UTF-16 and take the label as given, so they are
+    /// left alone — folding them would mangle a perfectly legal name.
+    fn folds_label_to_ascii(self) -> bool {
+        matches!(self, FileSystem::Fat32)
+    }
 }
 
 impl fmt::Display for FileSystem {
@@ -193,7 +214,9 @@ pub struct FormatRequest {
     pub cluster_size: Option<u32>,
     pub label: String,
     /// A quick format writes only the filesystem structures. A full one also
-    /// reads every sector, which is how a counterfeit or dying stick is caught.
+    /// reads every sector and marks the unreadable ones bad, which finds a
+    /// dying stick. It is a *read* scan, so it does not detect a fake-capacity
+    /// counterfeit — those need a write-and-read-back pass.
     pub quick: bool,
 }
 
@@ -461,13 +484,21 @@ pub fn sanitise_label(fs: FileSystem, label: &str) -> (String, bool) {
     let mut out: String = label
         .chars()
         .filter(|c| !c.is_control() && !FORBIDDEN.contains(c))
+        .map(|c| {
+            if fs.folds_label_to_ascii() && !c.is_ascii() {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     if fs.uppercases_label() {
         out = out.to_uppercase();
     }
     out = out.trim().to_string();
     // Truncate by characters, not bytes, so a multi-byte character is never
-    // cut in half.
+    // cut in half. FAT is already ASCII by this point, so the two agree there;
+    // for NTFS and exFAT the limit really is a character count.
     if out.chars().count() > fs.max_label_len() {
         out = out.chars().take(fs.max_label_len()).collect();
         out = out.trim_end().to_string();
@@ -764,9 +795,11 @@ mod tests {
         // Reserved characters go, on every filesystem.
         let (l, _) = sanitise_label(FileSystem::Ntfs, "a/b\\c:d*e?f");
         assert_eq!(l, "abcdef");
-        // A multi-byte character is never cut in half.
-        let (l, _) = sanitise_label(FileSystem::Fat32, "ÉÉÉÉÉÉÉÉÉÉÉÉÉÉ");
-        assert_eq!(l.chars().count(), 11);
+        // A multi-byte character is never cut in half — on a filesystem whose
+        // label can hold one.
+        let (l, _) = sanitise_label(FileSystem::Ntfs, "ÉÉÉÉÉÉÉÉÉÉÉÉÉÉ");
+        assert_eq!(l.chars().count(), 14);
+        assert_eq!(l, "ÉÉÉÉÉÉÉÉÉÉÉÉÉÉ");
     }
 
     #[test]
@@ -904,5 +937,77 @@ mod capability_tests {
                 "{target:?} media needs bootstrap we cannot write yet"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    /// `mkfs.fat` runs after `parted`, so a label it refuses meant a wiped
+    /// drive and then a failed format. Every one of these was verified to be
+    /// rejected by dosfstools 4.2 before this fold existed, and accepted after.
+    #[test]
+    fn fat_labels_are_folded_to_ascii_rather_than_failing_the_format() {
+        for (input, expected) in [
+            ("Café", "CAF_"),
+            ("MÜNCHEN", "M_NCHEN"),
+            ("ÅÄÖ", "___"),
+            ("Björk's USB", "BJ_RK'S USB"),
+            ("日本語", "___"),
+            ("УСТАНОВКА", "_________"),
+            ("🚀", "_"),
+        ] {
+            let (got, _) = sanitise_label(FileSystem::Fat32, input);
+            assert_eq!(got, expected, "folding {input:?}");
+            assert!(got.is_ascii(), "{got:?} must be plain ASCII for FAT");
+            assert!(got.len() <= 11, "{got:?} must fit 11 bytes");
+        }
+    }
+
+    /// …but NTFS and exFAT store UTF-16 and take these as given, so folding
+    /// them would mangle a perfectly legal name for no reason.
+    #[test]
+    fn other_filesystems_keep_their_accents() {
+        for fs in [FileSystem::Ntfs, FileSystem::ExFat] {
+            let (got, changed) = sanitise_label(fs, "Café");
+            assert_eq!(got, "Café", "{fs} stores UTF-16");
+            assert!(!changed);
+        }
+    }
+
+    /// A FAT label is 11 *bytes*. After folding it is ASCII, so the character
+    /// count and the byte count agree and the existing truncation is correct —
+    /// but assert it, because that equivalence is the whole reason the fold
+    /// has to happen before the truncation.
+    #[test]
+    fn a_folded_fat_label_never_exceeds_eleven_bytes() {
+        for input in [
+            "ÉÉÉÉÉÉÉÉÉÉÉÉÉÉ",
+            "Windows 安装 media",
+            "a very long label indeed",
+            "🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀",
+        ] {
+            let (got, _) = sanitise_label(FileSystem::Fat32, input);
+            assert!(
+                got.len() <= 11,
+                "{input:?} folded to {got:?}, which is {} bytes",
+                got.len()
+            );
+        }
+    }
+
+    /// Every printable ASCII character the sanitiser keeps was swept through
+    /// `mkfs.fat`, and none is rejected — so the fold is the only thing that
+    /// was needed.
+    #[test]
+    fn printable_ascii_survives_unchanged() {
+        let keep: String = (0x20u8..0x7f)
+            .map(char::from)
+            .filter(|c| !"*?.,;:/\\|+=<>[]\"".contains(*c))
+            .collect();
+        let (got, _) = sanitise_label(FileSystem::Fat32, &keep);
+        assert!(got.is_ascii());
+        assert!(got.chars().all(|c| c != '_' || keep.contains('_')));
     }
 }

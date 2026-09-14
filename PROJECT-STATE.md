@@ -235,9 +235,11 @@ marks the difference and the flasher must honour it:
 *before* its "everything from here on is destructive" line, and `assert_buildable` refuses
 anything outside GPT + UEFI + FAT32 by name.
 
-**`--full-format` is not cosmetic**: it passes `-c` to `mkfs.fat`, which reads every sector
-looking for bad ones. That is how a counterfeit or dying stick is caught before an image is
-trusted to it.
+**`--full-format` passes `-c` to `mkfs.fat`**: a read-only surface scan that marks
+unreadable sectors bad. It finds a *dying* stick. It is **not** a counterfeit check — a
+fake-capacity stick's unwritten sectors read back fine and its writes wrap silently, so
+catching one needs write-and-read-back. The read-back verification after an image is
+written is what actually does that, and it already runs by default.
 
 **Next, and needing a decision:**
 

@@ -1181,6 +1181,17 @@ fn collect_tree(
     Ok((dirs, files, total))
 }
 
+/// Total bytes of every regular file under `root`.
+///
+/// Used to check that an image's contents fit on a target *before* anything is
+/// wiped. Deliberately takes no exclusion list: when `install.wim` is too big
+/// for FAT32 it is excluded from the copy and then written back as `.swm`
+/// chunks of much the same size, so excluding it here would under-count by
+/// exactly the largest file and wave through the case most likely to overflow.
+pub fn tree_size(root: &Path) -> Result<u64> {
+    Ok(collect_tree(root, &[])?.2)
+}
+
 /// Recursively copy `src` into `dst`, skipping `exclude` (paths relative to
 /// `src`, e.g. `sources/install.wim`), reporting progress as it goes.
 ///
@@ -2202,6 +2213,15 @@ mod tests {
             25
         );
         assert!(dst.join("empty").is_dir(), "empty directories must survive");
+    }
+
+    /// Measured whole, with no exclusion list — an oversized install image is
+    /// split into `.swm` chunks of much the same total size, so leaving it out
+    /// would under-count by exactly the largest file.
+    #[test]
+    fn tree_size_counts_everything_including_what_the_copy_will_exclude() {
+        let (src, _dst) = tree("size");
+        assert_eq!(tree_size(&src).unwrap(), 100 + 500 + 50 + 25);
     }
 
     #[test]

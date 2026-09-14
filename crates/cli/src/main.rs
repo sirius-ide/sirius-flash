@@ -56,9 +56,10 @@ enum Cmd {
         /// Ask about a hypothetical drive of this many GB instead of a real one
         #[arg(long, value_name = "GB")]
         size_gb: Option<u64>,
-        /// Logical sector size. 512 everywhere except 4Kn media, where the
-        /// smaller cluster sizes disappear.
-        #[arg(long, default_value = "512")]
+        /// Logical sector size for a hypothetical drive. 512 everywhere except
+        /// 4Kn media, where the smaller cluster sizes disappear. Ignored with
+        /// --device, which reports its own.
+        #[arg(long, default_value = "512", value_parser = parse_sector_size)]
         sector_size: u32,
     },
 }
@@ -74,9 +75,22 @@ struct FormatArgs {
     /// Cluster size, e.g. 4096, 4K or 32K (default: best for the drive size)
     #[arg(long, value_name = "SIZE", help_heading = "Format options")]
     cluster_size: Option<String>,
-    /// Read every sector while formatting, to catch a counterfeit or dying stick
+    /// Read every sector while formatting and mark the unreadable ones bad.
+    /// Finds a dying stick; does NOT detect a fake-capacity counterfeit.
     #[arg(long, help_heading = "Format options")]
     full_format: bool,
+}
+
+/// A sector size has to be a power of two of at least 512, and zero would
+/// underflow the cluster mask rather than being rejected later.
+fn parse_sector_size(s: &str) -> Result<u32, String> {
+    let n: u32 = s.parse().map_err(|_| format!("{s:?} is not a number"))?;
+    if n < 512 || !n.is_power_of_two() {
+        return Err(format!(
+            "{n} is not a usable sector size; it must be a power of two of at least 512"
+        ));
+    }
+    Ok(n)
 }
 
 /// "32K" / "4096" -> bytes.
@@ -97,7 +111,11 @@ fn parse_cluster_size(s: &str) -> Result<u32> {
 impl FormatArgs {
     /// Turn the flags into a checked plan for this drive, or `None` to let the
     /// core pick its defaults.
-    fn to_plan(&self, device_size: u64) -> Result<Option<core::format::FormatPlan>> {
+    fn to_plan(
+        &self,
+        device_size: u64,
+        sector_size: u32,
+    ) -> Result<Option<core::format::FormatPlan>> {
         if self.label.is_none() && self.cluster_size.is_none() && !self.full_format {
             return Ok(None);
         }
@@ -113,9 +131,10 @@ impl FormatArgs {
             label: self.label.clone().unwrap_or_else(|| "WIN11USB".into()),
             quick: !self.full_format,
         };
-        Ok(Some(
-            request.validate(core::format::Volume::new(device_size, 512))?,
-        ))
+        Ok(Some(request.validate(core::format::Volume::new(
+            device_size,
+            sector_size,
+        ))?))
     }
 }
 
@@ -405,7 +424,7 @@ fn main() -> Result<()> {
 
             match k {
                 core::IsoKind::Windows => {
-                    let plan = format.to_plan(d.size_bytes)?;
+                    let plan = format.to_plan(d.size_bytes, d.sector_size)?;
                     core::flash_windows_iso(
                         &d,
                         &iso,
@@ -458,7 +477,10 @@ mod tests {
             cluster_size: None,
             full_format: false,
         };
-        assert!(args.to_plan(32 * 1024 * 1024 * 1024).unwrap().is_none());
+        assert!(args
+            .to_plan(32 * 1024 * 1024 * 1024, 512)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -469,7 +491,7 @@ mod tests {
             full_format: true,
         };
         let plan = args
-            .to_plan(32 * 1024 * 1024 * 1024)
+            .to_plan(32 * 1024 * 1024 * 1024, 512)
             .unwrap()
             .expect("flags were given");
         assert_eq!(plan.cluster_size(), 32768);
@@ -486,7 +508,7 @@ mod tests {
             cluster_size: Some("512".into()),
             full_format: false,
         };
-        let err = args.to_plan(32 * 1024 * 1024 * 1024).unwrap_err();
+        let err = args.to_plan(32 * 1024 * 1024 * 1024, 512).unwrap_err();
         assert!(err.to_string().contains("16 KB"), "got: {err}");
     }
 }
