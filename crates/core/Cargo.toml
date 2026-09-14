@@ -8,3 +8,4 @@ repository.workspace = true
 
 [dependencies]
 anyhow = "1"
+sha2 = "0.10"

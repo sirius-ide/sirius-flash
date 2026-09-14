@@ -4,6 +4,9 @@
 //! `/dev/disk/by-id` path, gated on removable + size checks. Kernel names
 //! (`sdb`, `nvme0n1`) are treated as unstable and never trusted for targeting.
 
+pub mod blockio;
+pub use blockio::{hex, Progress, Stage};
+
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
 
@@ -681,8 +684,25 @@ pub fn flash_windows_iso(d: &UsbDevice, iso: &Path, tweaks: Option<&WindowsTweak
 
 /// Write a Linux/other bootable ISO directly to the device. Requires root; erases the device.
 #[cfg(target_os = "linux")]
-pub fn flash_linux_iso(d: &UsbDevice, iso: &Path) -> Result<()> {
+pub fn flash_linux_iso(
+    d: &UsbDevice,
+    iso: &Path,
+    verify: bool,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<()> {
     assert_safe_target(d)?;
+    let size = fs::metadata(iso)
+        .with_context(|| format!("reading {}", iso.display()))?
+        .len();
+    // Catch this before wiping anything, rather than partway through the write.
+    if size > d.size_bytes {
+        bail!(
+            "image is {:.1} GiB but {} holds only {:.1} GiB",
+            size as f64 / 1024.0_f64.powi(3),
+            d.dev.display(),
+            d.size_gib()
+        );
+    }
     let dev = d.by_id.to_string_lossy().to_string();
     let _ = Command::new("bash")
         .arg("-c")
@@ -690,16 +710,13 @@ pub fn flash_linux_iso(d: &UsbDevice, iso: &Path) -> Result<()> {
             "for p in {dev}-part*; do umount \"$p\" 2>/dev/null || true; done"
         ))
         .status();
-    run(
-        "dd",
-        &[
-            &format!("if={}", iso.to_string_lossy()),
-            &format!("of={dev}"),
-            "bs=4M",
-            "oflag=sync",
-            "status=progress",
-        ],
-    )?;
+
+    let digest = blockio::write_image(iso, Path::new(&dev), on_progress)?;
+    println!("sha256 {}", hex(&digest));
+    if verify {
+        blockio::verify_written(Path::new(&dev), &digest, size, on_progress)?;
+        println!("verified: the device reads back byte-for-byte identical");
+    }
     Ok(())
 }
 
@@ -721,7 +738,12 @@ pub fn flash_windows_iso(
     bail!("Windows-ISO flashing not yet implemented on this OS")
 }
 #[cfg(not(target_os = "linux"))]
-pub fn flash_linux_iso(_d: &UsbDevice, _iso: &Path) -> Result<()> {
+pub fn flash_linux_iso(
+    _d: &UsbDevice,
+    _iso: &Path,
+    _verify: bool,
+    _on_progress: &mut dyn FnMut(Progress),
+) -> Result<()> {
     bail!("Linux-ISO flashing not yet implemented on this OS")
 }
 

@@ -35,6 +35,9 @@ enum Cmd {
         /// Skip the confirmation prompt
         #[arg(long)]
         yes: bool,
+        /// Skip reading the device back to confirm it matches the image
+        #[arg(long)]
+        no_verify: bool,
         #[command(flatten)]
         tweaks: TweakArgs,
     },
@@ -119,6 +122,47 @@ impl TweakArgs {
     }
 }
 
+fn human_bytes(b: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{b} B")
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+fn human_secs(s: u64) -> String {
+    if s >= 3600 {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    } else if s >= 60 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// One carriage-returned status line, so a terminal overwrites in place and
+/// the GUI (which splits on \r) gets one event per update.
+fn print_progress(p: core::Progress) {
+    let eta = p.eta_secs().map(human_secs).unwrap_or_else(|| "--".into());
+    print!(
+        "\r{} {:.0}% · {} / {} · {}/s · ETA {}    ",
+        p.stage.as_str(),
+        p.percent(),
+        human_bytes(p.bytes),
+        human_bytes(p.total),
+        human_bytes(p.bytes_per_sec),
+        eta
+    );
+    let _ = std::io::stdout().flush();
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -146,6 +190,7 @@ fn main() -> Result<()> {
             device,
             kind,
             yes,
+            no_verify,
             tweaks,
         } => {
             if !iso.exists() {
@@ -191,7 +236,10 @@ fn main() -> Result<()> {
 
             match k {
                 core::IsoKind::Windows => core::flash_windows_iso(&d, &iso, Some(&tw))?,
-                core::IsoKind::Other => core::flash_linux_iso(&d, &iso)?,
+                core::IsoKind::Other => {
+                    core::flash_linux_iso(&d, &iso, !no_verify, &mut print_progress)?;
+                    println!();
+                }
             }
             println!("Done. Safe to remove the USB.");
         }

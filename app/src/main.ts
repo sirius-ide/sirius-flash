@@ -21,6 +21,7 @@ const flashBtn = $<HTMLButtonElement>("flashBtn");
 const progPanel = $("progPanel");
 const progFill = $("progFill");
 const logEl = $("log");
+const progStat = $("progStat");
 const wueCard = $("wueCard");
 const twUser = $<HTMLInputElement>("twUser");
 const twUserName = $<HTMLInputElement>("twUserName");
@@ -163,11 +164,20 @@ flashBtn.addEventListener("click", async () => {
   }
 });
 
+// e.g. "write 27% · 1.2 GiB / 4.4 GiB · 45.0 MiB/s · ETA 1m10s"
+const PROGRESS_RE = /^(write|verify)\s+(\d{1,3})%\s+·\s+(.+?)\s*$/;
+
 function appendLog(s: string) {
+  const m = s.match(PROGRESS_RE);
+  if (m) {
+    // A live status line: replace it in place rather than flooding the log
+    // with one entry every 250 ms.
+    progStat.textContent = `${m[1] === "write" ? "Writing" : "Verifying"} — ${m[3]}`;
+    setProgress(Math.min(100, parseInt(m[2], 10)));
+    return;
+  }
   logEl.textContent += s + "\n";
   logEl.scrollTop = logEl.scrollHeight;
-  const m = s.match(/(\d{1,3})\s?%/);
-  if (m) setProgress(Math.min(100, parseInt(m[1], 10)));
 }
 function setProgress(p: number | null) {
   if (p === null) {
