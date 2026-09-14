@@ -36,12 +36,30 @@ fn list_devices() -> Result<Vec<DeviceDto>, String> {
         })
 }
 
+#[derive(Serialize)]
+struct ImageInfo {
+    kind: String,
+    /// "raw", "gzip", "xz", "zstd" or "bzip2".
+    compression: String,
+}
+
 #[tauri::command]
-fn detect_iso(path: String) -> Result<String, String> {
-    let k = core::detect_iso_kind(Path::new(&path)).map_err(|e| e.to_string())?;
-    Ok(match k {
-        core::IsoKind::Windows => "windows".into(),
-        core::IsoKind::Other => "other".into(),
+fn detect_iso(path: String) -> Result<ImageInfo, String> {
+    let p = Path::new(&path);
+    let compression = core::blockio::detect_compression(p).map_err(|e| e.to_string())?;
+    // A compressed image is a raw disk image, not a mountable installer, so
+    // there is nothing to inspect inside it.
+    let kind = if compression == core::blockio::Compression::None {
+        match core::detect_iso_kind(p).map_err(|e| e.to_string())? {
+            core::IsoKind::Windows => "windows",
+            core::IsoKind::Other => "other",
+        }
+    } else {
+        "other"
+    };
+    Ok(ImageInfo {
+        kind: kind.to_string(),
+        compression: compression.as_str().to_string(),
     })
 }
 

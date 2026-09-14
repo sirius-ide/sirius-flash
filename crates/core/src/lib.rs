@@ -702,14 +702,21 @@ pub fn flash_linux_iso(
     let size = fs::metadata(iso)
         .with_context(|| format!("reading {}", iso.display()))?
         .len();
-    // Catch this before wiping anything, rather than partway through the write.
-    if size > d.size_bytes {
+    let compression = blockio::detect_compression(iso)?;
+    // A compressed image's real size is unknown until it is unpacked, so only
+    // the raw case can be checked up front; the compressed case is caught by
+    // the ENOSPC handling in write_image. Either way this must happen before
+    // anything is wiped rather than partway through the write.
+    if compression == blockio::Compression::None && size > d.size_bytes {
         bail!(
             "image is {:.1} GiB but {} holds only {:.1} GiB",
             size as f64 / 1024.0_f64.powi(3),
             d.dev.display(),
             d.size_gib()
         );
+    }
+    if compression != blockio::Compression::None {
+        println!("decompressing {} image on the fly", compression.as_str());
     }
     let dev = d.by_id.to_string_lossy().to_string();
     let _ = Command::new("bash")
@@ -719,10 +726,17 @@ pub fn flash_linux_iso(
         ))
         .status();
 
-    let digest = blockio::write_image(iso, Path::new(&dev), on_progress)?;
-    println!("sha256 {}", hex(&digest));
+    let outcome = blockio::write_image(iso, Path::new(&dev), on_progress)?;
+    println!("sha256 {}", hex(&outcome.digest));
     if verify {
-        blockio::verify_written(Path::new(&dev), &digest, size, on_progress)?;
+        // Verify against what was actually written: for a compressed image
+        // that is the decompressed length, not the size of the file on disk.
+        blockio::verify_written(
+            Path::new(&dev),
+            &outcome.digest,
+            outcome.bytes_written,
+            on_progress,
+        )?;
         println!("verified: the device reads back byte-for-byte identical");
     }
     Ok(())

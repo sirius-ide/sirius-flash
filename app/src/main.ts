@@ -111,7 +111,12 @@ devSelect.addEventListener("change", () => {
 $("refreshBtn").addEventListener("click", refreshDevices);
 
 $("browseBtn").addEventListener("click", async () => {
-  const sel = await open({ multiple: false, filters: [{ name: "Disk image", extensions: ["iso", "img"] }] });
+  const sel = await open({
+    multiple: false,
+    filters: [
+      { name: "Disk image", extensions: ["iso", "img", "raw", "gz", "xz", "zst", "bz2", "wic"] },
+    ],
+  });
   if (!sel || Array.isArray(sel)) return;
   isoPath = sel;
   isoName.textContent = isoPath.split("/").pop() || isoPath;
@@ -119,12 +124,24 @@ $("browseBtn").addEventListener("click", async () => {
   isoKindEl.textContent = "detecting…";
   isoKindEl.className = "chip";
   try {
-    isoKind = await invoke<string>("detect_iso", { path: isoPath });
+    const info = await invoke<{ kind: string; compression: string }>("detect_iso", {
+      path: isoPath,
+    });
+    isoKind = info.kind;
     const win = isoKind === "windows";
-    isoKindEl.textContent = win ? "Windows installer" : "Linux / other ISO";
+    const packed = info.compression !== "raw";
+    isoKindEl.textContent = win
+      ? "Windows installer"
+      : packed
+        ? `Compressed image (${info.compression})`
+        : "Linux / other ISO";
     isoKindEl.className = "chip " + (win ? "chip-win" : "chip-lin");
     optMode.textContent = win ? "Windows" : "Linux / direct";
-    optFs.textContent = win ? "FAT32 + WIM split" : "Direct image write";
+    optFs.textContent = win
+      ? "FAT32 + WIM split"
+      : packed
+        ? "Decompress + write"
+        : "Direct image write";
     // The Windows tweaks only apply to a Windows installer.
     wueCard.hidden = !win;
     xmlPreview.hidden = true;
@@ -165,14 +182,19 @@ flashBtn.addEventListener("click", async () => {
 });
 
 // e.g. "write 27% · 1.2 GiB / 4.4 GiB · 45.0 MiB/s · ETA 1m10s"
-const PROGRESS_RE = /^(write|verify)\s+(\d{1,3})%\s+·\s+(.+?)\s*$/;
+const PROGRESS_RE = /^(write|verify|copy)\s+(\d{1,3})%\s+·\s+(.+?)\s*$/;
+const STAGE_LABEL: Record<string, string> = {
+  write: "Writing",
+  verify: "Verifying",
+  copy: "Copying",
+};
 
 function appendLog(s: string) {
   const m = s.match(PROGRESS_RE);
   if (m) {
     // A live status line: replace it in place rather than flooding the log
     // with one entry every 250 ms.
-    progStat.textContent = `${m[1] === "write" ? "Writing" : "Verifying"} — ${m[3]}`;
+    progStat.textContent = `${STAGE_LABEL[m[1]] ?? m[1]} — ${m[3]}`;
     setProgress(Math.min(100, parseInt(m[2], 10)));
     return;
   }

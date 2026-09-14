@@ -26,7 +26,7 @@ Sirius Flash does it the correct way, everywhere: GPT + FAT32 + split `install.w
 - [x] Tauri GUI (pick ISO → pick USB → flash) — dark themed, branded, live progress
 - [ ] Format options: MBR/GPT, BIOS/UEFI, filesystem, cluster size, volume label
 - [ ] UEFI:NTFS dual-partition layout (removes WIM splitting entirely)
-- [ ] Compressed images (`.gz` / `.xz` / `.zst` / `.bz2`)
+- [x] Compressed images (`.gz` / `.xz` / `.zst` / `.bz2`) — detected by content, streamed
 - [ ] Built-in ISO downloader (Linux catalogue, then Windows)
 - [ ] macOS backend
 - [ ] Windows backend

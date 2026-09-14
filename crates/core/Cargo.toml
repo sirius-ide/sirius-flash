@@ -9,3 +9,12 @@ repository.workspace = true
 [dependencies]
 anyhow = "1"
 sha2 = "0.10"
+
+# Streaming decompressors. All must stream: a disk image can be 8 GB+, so
+# decoding into memory is not an option. flate2/ruzstd/bzip2-rs are pure Rust;
+# liblzma is built statically from bundled source so there is no system
+# dependency on any platform.
+flate2 = "1"
+ruzstd = "0.7"
+bzip2-rs = "0.1"
+liblzma = { version = "0.4", features = ["static"] }
