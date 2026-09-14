@@ -177,6 +177,7 @@ pub fn open_image(path: &Path) -> Result<(Box<dyn Read>, u64, Compression, ByteC
 }
 
 /// What a write actually produced.
+#[derive(Debug)]
 pub struct WriteOutcome {
     /// SHA-256 of the bytes placed on the device (decompressed, if applicable).
     pub digest: [u8; 32],
@@ -310,6 +311,20 @@ pub fn write_image(
             })
         },
     )?;
+
+    // A decoder that yields nothing is not a successful write of an empty
+    // image — the file was non-empty, so this is a container we misread or one
+    // that was truncated in transit. Without this the device would be wiped,
+    // nothing written, and success reported along with the SHA-256 of no bytes
+    // at all. liblzma makes the risk concrete: it answers a zero-filled header
+    // with an empty stream and no error whatsoever.
+    if written == 0 {
+        bail!(
+            "{} decoded to zero bytes — it is not a usable {} image",
+            image.display(),
+            compression.as_str()
+        );
+    }
 
     // Push everything to the medium before anyone calls this done.
     out.flush().context("flushing device")?;
@@ -628,6 +643,26 @@ mod tests {
     #[test]
     fn decompresses_bzip2() {
         roundtrip("bz2", BZ2, Compression::Bzip2);
+    }
+
+    /// `gzip` of an empty file — a perfectly valid archive that decodes to
+    /// nothing, produced by the system `gzip` tool.
+    const EMPTY_GZ: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0x03, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    #[test]
+    fn a_container_that_decodes_to_nothing_is_an_error() {
+        // The file itself is not empty, so the up-front size check passes and
+        // only decoding reveals there is nothing to write.
+        let src = tmp("emptydecode");
+        let dst = tmp("emptydecodedst");
+        std::fs::write(&src, EMPTY_GZ).unwrap();
+        std::fs::write(&dst, b"").unwrap();
+        assert_eq!(detect_compression(&src).unwrap(), Compression::Gzip);
+        let err = write_image(&src, &dst, &mut noop).unwrap_err();
+        assert!(err.to_string().contains("zero bytes"), "got: {err}");
     }
 
     #[test]
