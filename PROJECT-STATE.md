@@ -34,7 +34,7 @@ infrastructure. They are offered together.
 | State doc | `PROJECT-STATE.md` at its repo root | this file |
 
 Shared infrastructure: `dl.siriuside.com` (CDN, Cloudflare R2), Pages for the landing
-site, Workers for update endpoints, GitHub Actions for CI. `gh` is authed as `iamthearsh`.
+site, Workers for update endpoints, GitHub Actions for CI.
 Logo and icon artwork is generated with Gemini Nano Banana and wired in by hand.
 
 The licences differ deliberately and must not be mixed: **no Rufus-derived code may enter
