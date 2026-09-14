@@ -19,6 +19,27 @@ Repo: `github.com/sirius-ide/sirius-flash` · Local: `~/Projects/sirius-flash`
 users for rufus and any other flashing tool for any os out there"* and *"we want to beat
 our competitors on all fronts."* Feature parity with Rufus is the floor, not the target.
 
+## 1b. The family
+
+Sirius Flash is the companion product to **Sirius IDE** — same owner, same GitHub org
+(`sirius-ide`), same copyright holder (Clicksora, L.L.C.), same Cloudflare-first
+infrastructure. They are offered together.
+
+| | Sirius IDE | Sirius Flash |
+|---|---|---|
+| What | Agentic AI editor, a Code - OSS (VS Code) fork | Bootable-USB creator |
+| Repo | `~/Projects/sirius` (branch `sirius`) | `~/Projects/sirius-flash` (branch `main`) |
+| Licence | Proprietary (`LicenseRef-Sirius`) | **GPL-3.0** — Rufus is GPL-3.0 and we adapt from it |
+| Status | Shipping, `v1.118.4`, live update server | Early development, Linux core first |
+| State doc | `PROJECT-STATE.md` at its repo root | this file |
+
+Shared infrastructure: `dl.siriuside.com` (CDN, Cloudflare R2), Pages for the landing
+site, Workers for update endpoints, GitHub Actions for CI. `gh` is authed as `iamthearsh`.
+Logo and icon artwork is generated with Gemini Nano Banana and wired in by hand.
+
+The licences differ deliberately and must not be mixed: **no Rufus-derived code may enter
+the proprietary IDE repo**, and Flash must stay GPL-3.0 for as long as it adapts from Rufus.
+
 ## 2. Layout
 
 ```
