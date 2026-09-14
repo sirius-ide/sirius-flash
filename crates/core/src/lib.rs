@@ -640,6 +640,51 @@ fn child_ignoring_case(dir: &Path, name: &str) -> Option<PathBuf> {
     })
 }
 
+/// Is this external tool on PATH?
+///
+/// Searched by hand rather than by running it: plenty of these have no
+/// `--version`, and spawning a formatter to ask whether it exists is a poor
+/// idea on a path whose whole job is not to touch anything yet.
+#[cfg(target_os = "linux")]
+fn tool_exists(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file() && {
+            use std::os::unix::fs::PermissionsExt;
+            fs::metadata(&candidate)
+                .map(|m| m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        }
+    })
+}
+
+/// Fail now if anything this run will need is missing.
+///
+/// Every external tool the destructive phase uses has to be checked *before*
+/// that phase, not when it is reached. `wimlib-imagex` was the worst of these:
+/// it runs after the partitioning, the format and the whole file copy, so a
+/// machine without it lost the drive's contents, waited through several
+/// gigabytes of copying, and only then heard that a package was missing.
+/// `mkfs.fat` had the same shape one step earlier.
+///
+/// Reports everything missing at once, because being told about them one
+/// reinstall at a time is its own kind of unhelpful.
+#[cfg(target_os = "linux")]
+fn require_tools(tools: &[&str]) -> Result<()> {
+    let missing: Vec<&str> = tools.iter().copied().filter(|t| !tool_exists(t)).collect();
+    if !missing.is_empty() {
+        bail!(
+            "these tools are needed but not installed: {}. Nothing has been written to \
+             the drive.",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// Where the single partition the Windows path creates begins.
 ///
 /// `parted ... mkpart WIN11 fat32 1MiB 100%` — so the filesystem never spans
@@ -784,6 +829,19 @@ pub fn flash_windows_iso(
             d.dev.display(),
             usable as f64 / 1024.0_f64.powi(3)
         );
+    }
+
+    // Everything the destructive phase will shell out to, checked while the
+    // drive is still intact. The splitter is only required when the install
+    // image actually exceeds what FAT32 can hold.
+    let mut needed = vec!["parted", "udevadm", "mkfs.fat", "mount", "umount", "sync"];
+    const FAT32_MAX_FILE_PREFLIGHT: u64 = 4 * 1024 * 1024 * 1024 - 1;
+    if img_size > FAT32_MAX_FILE_PREFLIGHT {
+        needed.push("wimlib-imagex");
+    }
+    if let Err(e) = require_tools(&needed) {
+        let _ = Command::new("umount").arg(iso_mnt).status();
+        return Err(e);
     }
 
     // ---- everything from here on is destructive ----
@@ -1235,6 +1293,36 @@ mod tests {
         );
         assert_eq!(by_drive, vec![16384, 32768, 65536]);
         assert!(by_partition.contains(&8192), "the partition allows smaller");
+    }
+
+    /// Every external tool the destructive phase uses must be checked before
+    /// that phase runs. `wimlib-imagex` was invoked sixty lines past the point
+    /// of no return, so a machine without it lost the drive, copied several
+    /// gigabytes, and only then reported a missing package.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_tools_are_reported_together_and_before_anything_is_written() {
+        // Something certain to exist, and two that cannot.
+        assert!(require_tools(&["sh"]).is_ok());
+        let err = require_tools(&["sh", "definitely-not-a-real-tool-xyz"]).unwrap_err();
+        assert!(err.to_string().contains("definitely-not-a-real-tool-xyz"));
+        assert!(
+            err.to_string().contains("Nothing has been written"),
+            "the user needs to know the drive is untouched: {err}"
+        );
+        // All of them at once, not one per attempt.
+        let err = require_tools(&["no-such-tool-a", "no-such-tool-b"]).unwrap_err();
+        assert!(err.to_string().contains("no-such-tool-a"));
+        assert!(err.to_string().contains("no-such-tool-b"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tool_lookup_ignores_directories_and_unexecutable_files() {
+        assert!(tool_exists("sh"));
+        assert!(!tool_exists("this-is-not-on-path-at-all"));
+        // A bare path separator must not be treated as a hit.
+        assert!(!tool_exists(""));
     }
 
     #[test]
