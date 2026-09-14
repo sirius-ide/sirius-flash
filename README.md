@@ -37,6 +37,15 @@ cargo build --release        # core + CLI
 cd app && pnpm install && pnpm tauri dev   # launch the GUI
 ```
 
+## Credits
+
+Sirius Flash stands on the shoulders of [**Rufus**](https://github.com/pbatard/rufus) by Pete Batard,
+also GPL-3.0. Its `wue.c` was studied as the reference for Windows Setup's answer-file
+behaviour — in particular that WinPE requires a (possibly empty) `ProductKey` element, that
+`unattend.xml` passwords are `Base64(UTF-16LE(password + "Password"))`, and that only a single
+`<FirstLogonCommands>` section is permitted. Thanks for two decades of making bootable media
+bearable.
+
 ## License
 
 GPL-3.0 — © Clicksora, L.L.C. Free and open source.
