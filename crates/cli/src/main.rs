@@ -46,6 +46,94 @@ enum Cmd {
         #[command(flatten)]
         tweaks: TweakArgs,
     },
+    /// Show which format options are legal for a device (writes nothing)
+    FormatOptions {
+        /// Target device: its /dev/disk/by-id path (from `list`)
+        #[arg(long, conflicts_with = "size_gb")]
+        device: Option<String>,
+        /// Ask about a hypothetical drive of this many GB instead of a real one
+        #[arg(long, value_name = "GB")]
+        size_gb: Option<u64>,
+        /// Logical sector size. 512 everywhere except 4Kn media, where the
+        /// smaller cluster sizes disappear.
+        #[arg(long, default_value = "512")]
+        sector_size: u32,
+    },
+}
+
+/// Print every legal combination for a drive, and say which of them this
+/// build can actually make bootable.
+fn show_format_options(size_bytes: u64, sector_size: u32) -> Result<()> {
+    use core::format::*;
+    let volume = Volume::new(size_bytes, sector_size);
+    println!(
+        "Drive: {:.1} GiB, {} byte sectors\n",
+        size_bytes as f64 / 1024.0_f64.powi(3),
+        sector_size
+    );
+    let mut any = false;
+    for scheme in [PartitionScheme::Mbr, PartitionScheme::Gpt] {
+        for target in target_systems_for(scheme) {
+            let filesystems = filesystems_for(scheme, *target, volume);
+            if filesystems.is_empty() {
+                continue;
+            }
+            for fs in filesystems {
+                let sizes = cluster_sizes(fs, volume);
+                let default = default_cluster_size(fs, volume);
+                let request = FormatRequest {
+                    scheme,
+                    target: *target,
+                    filesystem: fs,
+                    cluster_size: None,
+                    label: String::new(),
+                    quick: true,
+                };
+                // Everything advertised must validate; if it does not, that is a
+                // bug in the model rather than something to print.
+                let plan = request.validate(volume)?;
+                any = true;
+                println!(
+                    "{:<4} + {:<13} + {:<6}  clusters: {}",
+                    scheme.as_str().to_uppercase(),
+                    target.as_str(),
+                    fs.as_str(),
+                    sizes
+                        .iter()
+                        .map(|c| {
+                            let mark = if Some(*c) == default { "*" } else { "" };
+                            format!("{}{mark}", human(*c))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                if plan.needs_boot_code() {
+                    println!(
+                        "        not yet: BIOS media needs an MBR bootstrap and a partition \
+                         boot record, which this build does not write"
+                    );
+                }
+                for w in plan.warnings() {
+                    println!("        note: {w}");
+                }
+            }
+        }
+    }
+    if !any {
+        bail!("no filesystem can be created on a drive this size");
+    }
+    println!("\n* = default. A row marked \"not yet\" would format, and would not boot.");
+    Ok(())
+}
+
+fn human(n: u32) -> String {
+    if n >= 1 << 20 {
+        format!("{}M", n >> 20)
+    } else if n >= 1 << 10 {
+        format!("{}K", n >> 10)
+    } else {
+        format!("{n}B")
+    }
 }
 
 #[derive(ValueEnum, Clone)]
@@ -184,6 +272,28 @@ fn main() -> Result<()> {
         }
         Cmd::Unattend { tweaks } => {
             print!("{}", core::generate_autounattend(&tweaks.to_tweaks())?);
+        }
+        Cmd::FormatOptions {
+            device,
+            size_gb,
+            sector_size,
+        } => {
+            let size_bytes = match (device, size_gb) {
+                (Some(device), _) => {
+                    core::list_removable_devices()?
+                        .into_iter()
+                        .find(|d| {
+                            d.by_id.to_string_lossy() == device || d.dev.to_string_lossy() == device
+                        })
+                        .ok_or_else(|| {
+                            anyhow!("{device} is not one of the removable devices `list` reports")
+                        })?
+                        .size_bytes
+                }
+                (None, Some(gb)) => gb * 1024 * 1024 * 1024,
+                (None, None) => bail!("give either --device or --size-gb"),
+            };
+            show_format_options(size_bytes, sector_size)?;
         }
         Cmd::Write {
             iso,
