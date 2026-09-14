@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Streaming decompressors. All must stream: a disk image can be 8 GB+, so
 # decoding into memory is not an option. flate2/ruzstd/bzip2-rs are pure Rust;
