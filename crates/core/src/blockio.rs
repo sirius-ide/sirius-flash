@@ -81,6 +81,7 @@ pub enum Compression {
     Xz,
     Zstd,
     Bzip2,
+    Lzma,
 }
 
 impl Compression {
@@ -91,6 +92,7 @@ impl Compression {
             Compression::Xz => "xz",
             Compression::Zstd => "zstd",
             Compression::Bzip2 => "bzip2",
+            Compression::Lzma => "lzma",
         }
     }
 
@@ -104,19 +106,91 @@ impl Compression {
             Compression::Zstd
         } else if magic.starts_with(b"BZh") {
             Compression::Bzip2
+        } else if looks_like_lzma_alone(magic) {
+            Compression::Lzma
         } else {
             Compression::None
         }
     }
 }
 
+/// Largest LZMA dictionary we will accept, and the basis of the memory bound
+/// below. Real encoders top out at 64 MiB (`lzma -9`), so 1 GiB is generous.
+const MAX_LZMA_DICT: u32 = 1 << 30;
+
+/// Smallest dictionary the LZMA format permits.
+const MIN_LZMA_DICT: u32 = 1 << 12;
+
+/// Memory ceiling handed to liblzma: the largest dictionary we accept, plus
+/// headroom for the decoder's own structures.
+const LZMA_MEMLIMIT: u64 = (MAX_LZMA_DICT as u64) * 2;
+
+/// Does this look like a headerless LZMA ("alone") stream?
+///
+/// This is the one format here with **no magic number**. Its 13-byte header is
+/// a properties byte, a u32 dictionary size and a u64 uncompressed size — all
+/// of which a raw disk image can match by accident. Getting this wrong is not
+/// a cosmetic bug: liblzma decodes a zero-filled header to an *empty stream
+/// without erroring*, so a false positive would wipe the target, write nothing,
+/// and report success. Detection is therefore deliberately strict, and every
+/// check below earns its place against a real image format:
+///
+/// | header                    | rejected by              |
+/// |---------------------------|--------------------------|
+/// | ISO9660 / ext4 / MBR / GPT (13 zero bytes) | dictionary size 0 |
+/// | FAT32 / NTFS / exFAT (`eb ..` jump)        | properties byte ≥ 225 |
+/// | squashfs, VMDK, QCOW2, DMG, HFS+, ELF      | dictionary not a power of two |
+///
+/// The power-of-two requirement is the load-bearing one: a plain range check
+/// admits VMDK and QCOW2. Every real encoder emits a power of two (verified
+/// across `lzma -0..-9` and `xz --format=lzma`), so this costs us nothing.
+fn looks_like_lzma_alone(magic: &[u8]) -> bool {
+    if magic.len() < 13 {
+        return false;
+    }
+    // (pb * 5 + lp) * 9 + lc, with lc < 9, lp < 5, pb < 5.
+    if magic[0] >= 225 {
+        return false;
+    }
+    let dict = u32::from_le_bytes([magic[1], magic[2], magic[3], magic[4]]);
+    if !dict.is_power_of_two() || !(MIN_LZMA_DICT..=MAX_LZMA_DICT).contains(&dict) {
+        return false;
+    }
+    // Either "unknown" or a size we could plausibly write to a USB stick.
+    let uncompressed = u64::from_le_bytes([
+        magic[5], magic[6], magic[7], magic[8], magic[9], magic[10], magic[11], magic[12],
+    ]);
+    uncompressed == u64::MAX || uncompressed <= MAX_PLAUSIBLE_IMAGE
+}
+
+/// 4 TiB. Larger than any bootable image, smaller than the random u64 an
+/// unrelated file's bytes would produce.
+const MAX_PLAUSIBLE_IMAGE: u64 = 4 << 40;
+
+/// Fill `buf` as far as the file allows, returning how many bytes were read.
+///
+/// A single `read` is permitted to return fewer bytes than asked for. The
+/// magic-number formats tolerate that, but LZMA detection needs all 13 of its
+/// header bytes — a short read would silently downgrade a `.lzma` image to
+/// "raw" and write the compressed bytes to the device.
+fn read_full(f: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match f.read(&mut buf[n..])? {
+            0 => break,
+            got => n += got,
+        }
+    }
+    Ok(n)
+}
+
 /// Detect how `path` is compressed.
 pub fn detect_compression(path: &Path) -> Result<Compression> {
     let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut magic = [0u8; 8];
-    let n = f
-        .read(&mut magic)
-        .with_context(|| format!("reading {}", path.display()))?;
+    // 16 rather than 8: the LZMA-alone header is 13 bytes and has no magic
+    // number, so all of it is needed to tell it from a raw image.
+    let mut magic = [0u8; 16];
+    let n = read_full(&mut f, &mut magic).with_context(|| format!("reading {}", path.display()))?;
     Ok(Compression::sniff(&magic[..n]))
 }
 
@@ -168,6 +242,15 @@ pub fn open_image(path: &Path) -> Result<(Box<dyn Read>, u64, Compression, ByteC
         Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(counted)),
         Compression::Xz => Box::new(liblzma::read::XzDecoder::new(counted)),
         Compression::Bzip2 => Box::new(bzip2_rs::DecoderReader::new(counted)),
+        // The LZMA-alone container, as produced by `lzma` and `xz --format=lzma`.
+        // The memory limit is derived from the dictionary bound that `sniff`
+        // already enforces, so a malformed header cannot make liblzma allocate
+        // without bound. Both checks are deliberate: neither relies on the other.
+        Compression::Lzma => Box::new(liblzma::read::XzDecoder::new_stream(
+            counted,
+            liblzma::stream::Stream::new_lzma_decoder(LZMA_MEMLIMIT)
+                .map_err(|e| anyhow::anyhow!("not a readable lzma image: {e}"))?,
+        )),
         Compression::Zstd => Box::new(
             ruzstd::StreamingDecoder::new(counted)
                 .map_err(|e| anyhow::anyhow!("not a readable zstd image: {e}"))?,
@@ -603,6 +686,15 @@ mod tests {
         0x22, 0x9c, 0x28, 0x48, 0x11, 0xf6, 0x00, 0xc8, 0x80,
     ];
 
+    /// `lzma` of PAYLOAD, produced by the system `lzma` tool (64 MiB dictionary).
+    const LZMA: &[u8] = &[
+        0x5d, 0x00, 0x00, 0x00, 0x04, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x29,
+        0x92, 0x46, 0x8a, 0x01, 0x1b, 0x6e, 0x7b, 0xec, 0x1f, 0x25, 0x45, 0xbc, 0xe9, 0xcf, 0x7c,
+        0x2d, 0xcd, 0xe4, 0x2e, 0xdc, 0x4c, 0xf4, 0x1e, 0x36, 0x32, 0xb6, 0x5b, 0x67, 0x22, 0x83,
+        0x2f, 0x68, 0x20, 0x11, 0x38, 0xd8, 0x07, 0x64, 0x4a, 0x81, 0xe6, 0x65, 0x71, 0x75, 0xa8,
+        0xa1, 0xe8, 0x92, 0x5a, 0xbb, 0xff, 0xfc, 0xf3, 0x30, 0x00,
+    ];
+
     fn roundtrip(tag: &str, blob: &[u8], expect: Compression) {
         let src = tmp(&format!("c-{tag}-src"));
         let dst = tmp(&format!("c-{tag}-dst"));
@@ -645,6 +737,11 @@ mod tests {
         roundtrip("bz2", BZ2, Compression::Bzip2);
     }
 
+    #[test]
+    fn decompresses_lzma() {
+        roundtrip("lzma", LZMA, Compression::Lzma);
+    }
+
     /// `gzip` of an empty file — a perfectly valid archive that decodes to
     /// nothing, produced by the system `gzip` tool.
     const EMPTY_GZ: &[u8] = &[
@@ -677,8 +774,124 @@ mod tests {
         assert_eq!(Compression::sniff(XZ), Compression::Xz);
         assert_eq!(Compression::sniff(ZST), Compression::Zstd);
         assert_eq!(Compression::sniff(BZ2), Compression::Bzip2);
+        assert_eq!(Compression::sniff(LZMA), Compression::Lzma);
         assert_eq!(Compression::sniff(b"CD001 plain iso"), Compression::None);
         assert_eq!(Compression::sniff(b""), Compression::None);
+    }
+
+    /// LZMA-alone has no magic number, so this is the test that stands between
+    /// a user's ISO and a wiped drive. Each row is the real leading bytes of a
+    /// format somebody could plausibly hand us; none may sniff as LZMA.
+    ///
+    /// These matter more than usual because liblzma does not reject a bad
+    /// header — it decodes a zero-filled one to an empty stream and returns
+    /// success.
+    #[test]
+    fn lzma_detection_never_fires_on_a_real_disk_image() {
+        // Leading 13+ bytes, captured from real images built with mkfs.vfat,
+        // mkfs.ext4, genisoimage and fdisk, plus documented on-disk headers.
+        let not_lzma: &[(&str, &[u8])] = &[
+            ("iso9660 system area", &[0u8; 16]),
+            ("ext4", &[0u8; 16]),
+            ("mbr, zero boot code", &[0u8; 16]),
+            ("gpt protective mbr", &[0u8; 16]),
+            (
+                "fat32",
+                &[
+                    0xeb, 0x58, 0x90, 0x6d, 0x6b, 0x66, 0x73, 0x2e, 0x66, 0x61, 0x74, 0x00, 0x02,
+                    0x01, 0x20, 0x00,
+                ],
+            ),
+            (
+                "ntfs",
+                &[
+                    0xeb, 0x52, 0x90, 0x4e, 0x54, 0x46, 0x53, 0x20, 0x20, 0x20, 0x20, 0x00, 0x02,
+                    0x08, 0x00, 0x00,
+                ],
+            ),
+            (
+                "exfat",
+                &[
+                    0xeb, 0x76, 0x90, 0x45, 0x58, 0x46, 0x41, 0x54, 0x20, 0x20, 0x20, 0x00, 0x00,
+                    0x00, 0x00, 0x00,
+                ],
+            ),
+            (
+                "squashfs",
+                &[
+                    0x68, 0x73, 0x71, 0x73, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc8,
+                    0xb4, 0x00, 0x00,
+                ],
+            ),
+            (
+                "vmdk",
+                &[
+                    0x4b, 0x44, 0x4d, 0x56, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00,
+                ],
+            ),
+            (
+                "qcow2",
+                &[
+                    0x51, 0x46, 0x49, 0xfb, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00,
+                ],
+            ),
+            (
+                "apple dmg trailer",
+                &[
+                    0x6b, 0x6f, 0x6c, 0x79, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x02, 0x00, 0x00,
+                    0x00, 0x00, 0x00,
+                ],
+            ),
+            (
+                "hfs+",
+                &[
+                    0x48, 0x2b, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00,
+                ],
+            ),
+            (
+                "elf",
+                &[
+                    0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00,
+                ],
+            ),
+            ("erased nor flash", &[0xffu8; 16]),
+        ];
+        for (name, head) in not_lzma {
+            assert_ne!(
+                Compression::sniff(head),
+                Compression::Lzma,
+                "{name} must never be mistaken for an lzma image"
+            );
+        }
+
+        // ...while every dictionary size a real encoder emits is accepted.
+        // Verified against `lzma -0` through `lzma -9` and `xz --format=lzma`.
+        for shift in 12..=30 {
+            let mut head = [0xffu8; 13];
+            head[0] = 0x5d;
+            head[1..5].copy_from_slice(&(1u32 << shift).to_le_bytes());
+            assert_eq!(
+                Compression::sniff(&head),
+                Compression::Lzma,
+                "a 2^{shift}-byte dictionary is a legitimate lzma image"
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_lzma_image_fails_loudly() {
+        // Header only, no payload. This must be an error, never a silent
+        // zero-byte "success".
+        let src = tmp("trunclzma");
+        let dst = tmp("trunclzmadst");
+        std::fs::write(&src, &LZMA[..13]).unwrap();
+        std::fs::write(&dst, b"").unwrap();
+        assert_eq!(detect_compression(&src).unwrap(), Compression::Lzma);
+        assert!(write_image(&src, &dst, &mut noop).is_err());
     }
 
     #[test]
