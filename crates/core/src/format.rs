@@ -240,6 +240,25 @@ impl FormatPlan {
     pub fn warnings(&self) -> &[Warning] {
         &self.warnings
     }
+
+    /// Does making this plan *bootable* require boot code we do not write?
+    ///
+    /// This is the line between what the options model can describe and what
+    /// this build can actually produce, and it is not the same line.
+    ///
+    /// A UEFI target needs no boot code at all: the firmware reads FAT itself
+    /// and loads `\EFI\BOOT\BOOTX64.EFI` off the volume, which is why the
+    /// existing GPT+FAT32 Windows path works without writing a single byte of
+    /// bootstrap. A BIOS target is the opposite — the firmware only executes
+    /// sector 0, so the media needs an MBR bootstrap *and* a partition boot
+    /// record for the filesystem, which is what Rufus carries `src/ms-sys/`
+    /// for (`write_win7_mbr`, `write_fat_32_br`, `write_ntfs_br`).
+    ///
+    /// We have none of that yet. Formatting for BIOS would succeed and produce
+    /// a drive that silently does not boot, so the flasher refuses instead.
+    pub fn needs_boot_code(&self) -> bool {
+        matches!(self.target, TargetSystem::Bios | TargetSystem::BiosOrUefi)
+    }
 }
 
 /// Which target systems make sense for a partition scheme.
@@ -838,5 +857,52 @@ mod tests {
         assert!(r.validate(Volume::new(0, 512)).is_err());
         assert!(r.validate(Volume::new(8 * GB, 500)).is_err());
         assert!(r.validate(Volume::new(8 * GB, 256)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    /// The options model deliberately describes more than this build can make.
+    /// A UEFI target needs no boot code — the firmware reads FAT and loads the
+    /// EFI binary itself — while a BIOS target needs an MBR bootstrap and a
+    /// partition boot record that we do not write. Formatting for BIOS would
+    /// succeed and hand the user a drive that silently does not boot, so the
+    /// distinction has to be visible to the flasher.
+    #[test]
+    fn bios_targets_are_flagged_as_needing_boot_code_we_do_not_write() {
+        let v = Volume::new(32 * GB, 512);
+        let uefi = FormatRequest {
+            scheme: PartitionScheme::Gpt,
+            target: TargetSystem::Uefi,
+            filesystem: FileSystem::Fat32,
+            cluster_size: None,
+            label: "SIRIUS".into(),
+            quick: true,
+        }
+        .validate(v)
+        .unwrap();
+        assert!(
+            !uefi.needs_boot_code(),
+            "UEFI boots FAT unaided; this is the path that already ships"
+        );
+
+        for target in [TargetSystem::Bios, TargetSystem::BiosOrUefi] {
+            let plan = FormatRequest {
+                scheme: PartitionScheme::Mbr,
+                target,
+                filesystem: FileSystem::Fat32,
+                cluster_size: None,
+                label: "SIRIUS".into(),
+                quick: true,
+            }
+            .validate(v)
+            .unwrap();
+            assert!(
+                plan.needs_boot_code(),
+                "{target:?} media needs bootstrap we cannot write yet"
+            );
+        }
     }
 }

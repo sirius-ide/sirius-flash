@@ -79,7 +79,7 @@ Cargo workspace **excludes** `app/` (the Tauri app has its own lockfile; CI audi
 - [x] CI green on Ubuntu / macOS / Windows: fmt, `clippy -D warnings`, tests, release build
 - [x] Security: `cargo audit` on both lockfiles, Dependabot, secret scanning, push protection
 
-**83 tests** (18 in `lib.rs`, 41 in `blockio.rs`, 12 in `lzw.rs`, 12 in `format.rs`); 77 are
+**84 tests** (18 in `lib.rs`, 41 in `blockio.rs`, 12 in `lzw.rs`, 13 in `format.rs`); 78 are
 platform-independent — that count is the working proxy for how much of the core is ready
 for the macOS backend.
 
@@ -217,9 +217,25 @@ Two findings worth keeping:
   disagree: on a 256 MB volume the FAT32 default is 512 B, because a default the mask has
   just excluded is reset to the smallest one still allowed.
 
-**Next:** wire the model into `flash_windows_iso`, which currently hardcodes
-`mklabel gpt` / `mkfs.fat -F 32` / label `WIN11USB`, and expose it in the CLI and GUI.
-Validation must land before `lib.rs`'s "everything from here on is destructive" line.
+**The model describes more than this build can make, on purpose.** `needs_boot_code()`
+marks the difference and the flasher must honour it:
+
+- A **UEFI** target needs no boot code. The firmware reads FAT itself and loads
+  `\EFI\BOOT\BOOTX64.EFI` off the volume, which is exactly why the existing GPT+FAT32
+  Windows path works without writing a single byte of bootstrap.
+- A **BIOS** target needs an MBR bootstrap *and* a partition boot record for the
+  filesystem. Rufus carries `src/ms-sys/` for this (`write_win7_mbr`, `write_fat_32_br`,
+  `write_ntfs_br`). **We write none of it.** Formatting for BIOS would succeed and hand the
+  user a drive that silently does not boot — so it must be refused, not attempted.
+
+**Next:** expose the model read-only first (a `format-options` subcommand that prints the
+legal sets for a device, mirroring how `unattend` prints without writing), then wire it into
+`flash_windows_iso` for the UEFI subset only. That function currently hardcodes
+`mklabel gpt` / `mkfs.fat -F 32` / label `WIN11USB`, and validation must land before its
+"everything from here on is destructive" line (`lib.rs:611`).
+
+Writing BIOS boot sectors is its own piece of work, and is what would unlock MBR/BIOS
+targets and NTFS-for-BIOS.
 
 The **UEFI:NTFS dual-partition layout** comes after, and the earlier note here claiming it
 "removes WIM splitting entirely" was wrong on both halves. Researched 2026-09-14; keep this
@@ -275,7 +291,7 @@ support · bad-block check.
 
 ```bash
 cargo build --release                       # core + CLI
-cargo test --workspace                      # 83 tests
+cargo test --workspace                      # 84 tests
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 cd app && pnpm install && pnpm tauri dev    # GUI
 ```
