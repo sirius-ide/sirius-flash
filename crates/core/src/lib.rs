@@ -5,6 +5,7 @@
 //! (`sdb`, `nvme0n1`) are treated as unstable and never trusted for targeting.
 
 pub mod blockio;
+pub mod format;
 pub mod lzw;
 pub use blockio::{hex, Progress, Stage};
 
