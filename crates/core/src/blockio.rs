@@ -22,6 +22,16 @@ const BUF_SIZE: usize = 4 * 1024 * 1024;
 /// to flood the GUI's event channel.
 const TICK: Duration = Duration::from_millis(250);
 
+/// Largest zstd window we will decode.
+///
+/// ruzstd defaults to a 100 MB cap and, since 0.9, applies it to the *first*
+/// frame as well as later ones — which rejects images written with
+/// `zstd --long` (windowLog 27 is already 128 MiB). 4 GiB covers everything
+/// the reference encoder emits. The window buffer grows on demand, so a larger
+/// ceiling costs nothing until a frame actually needs it, and anything past it
+/// still fails in `open_image`, before the device has been touched.
+const MAX_ZSTD_WINDOW: u64 = 4 * 1024 * 1024 * 1024;
+
 /// Which long-running stage a [`Progress`] update belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -387,7 +397,7 @@ pub fn open_image(path: &Path) -> Result<(Box<dyn Read>, u64, Compression, ByteC
                 .map_err(|e| anyhow::anyhow!("not a readable lzma image: {e}"))?,
         )),
         Compression::Zstd => Box::new(
-            ruzstd::StreamingDecoder::new(counted)
+            ruzstd::decoding::StreamingDecoder::new_with_max_window_size(counted, MAX_ZSTD_WINDOW)
                 .map_err(|e| anyhow::anyhow!("not a readable zstd image: {e}"))?,
         ),
     };
@@ -900,6 +910,16 @@ mod tests {
         0x86, 0x8c, 0x19, 0x34, 0x6a, 0xd8, 0xb8, 0x81, 0x23, 0x07,
     ];
 
+    /// `zstd --long=27` of PAYLOAD: a 128 MiB window, well past the 100 MB
+    /// default cap ruzstd began applying to the first frame in 0.9.
+    const ZST_LONG_WINDOW: &[u8] = &[
+        0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x88, 0x81, 0x01, 0x00, 0x53, 0x49, 0x52, 0x49, 0x55, 0x53,
+        0x2d, 0x46, 0x4c, 0x41, 0x53, 0x48, 0x2d, 0x43, 0x4f, 0x4d, 0x50, 0x52, 0x45, 0x53, 0x53,
+        0x49, 0x4f, 0x4e, 0x2d, 0x54, 0x45, 0x53, 0x54, 0x2d, 0x50, 0x41, 0x59, 0x4c, 0x4f, 0x41,
+        0x44, 0x2d, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0xd4, 0xf2, 0xfb,
+        0xd4,
+    ];
+
     fn roundtrip(tag: &str, blob: &[u8], expect: Compression) {
         let src = tmp(&format!("c-{tag}-src"));
         let dst = tmp(&format!("c-{tag}-dst"));
@@ -1030,6 +1050,20 @@ mod tests {
         assert_eq!(detect_compression(&src).unwrap(), Compression::Zip);
         let err = write_image(&src, &dst, &mut noop).unwrap_err();
         assert!(err.to_string().contains("no files"), "got: {err}");
+    }
+
+    /// ruzstd 0.9 began applying its 100 MB default window cap to the first
+    /// frame as well as later ones, which would refuse every image written
+    /// with `zstd --long`. We raise the cap rather than inherit that.
+    #[test]
+    fn a_large_zstd_window_is_still_accepted() {
+        let src = tmp("zst-long-src");
+        let dst = tmp("zst-long-dst");
+        std::fs::write(&src, ZST_LONG_WINDOW).unwrap();
+        std::fs::write(&dst, b"").unwrap();
+        let o = write_image(&src, &dst, &mut noop).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), PAYLOAD);
+        assert_eq!(o.compression, Compression::Zstd);
     }
 
     #[test]

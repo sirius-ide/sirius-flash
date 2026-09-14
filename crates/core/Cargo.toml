@@ -15,7 +15,7 @@ sha2 = "0.11"
 # liblzma is built statically from bundled source so there is no system
 # dependency on any platform.
 flate2 = "1"
-ruzstd = "0.7"
+ruzstd = "0.9"
 bzip2-rs = "0.1"
 liblzma = { version = "0.4", features = ["static"] }
 # Read-only, and only the two member encodings a disk image ever uses. The
