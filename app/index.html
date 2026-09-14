@@ -52,6 +52,27 @@
           </div>
         </section>
 
+        <section class="card" id="wueCard" hidden>
+          <span class="card-num">4</span>
+          <div class="card-body">
+            <label class="card-label">Windows user experience</label>
+            <div class="wue">
+              <label class="chk"><input type="checkbox" id="twBypassHw" checked /><i></i><span>Remove requirement for <b>TPM&nbsp;2.0</b>, <b>Secure&nbsp;Boot</b> and <b>4&nbsp;GB&nbsp;RAM</b></span></label>
+              <label class="chk"><input type="checkbox" id="twBypassExtra" /><i></i><span>Also bypass <b>CPU</b> and <b>disk</b> checks — for older PCs</span></label>
+              <label class="chk"><input type="checkbox" id="twSkipMsa" checked /><i></i><span>Remove requirement for a <b>Microsoft&nbsp;account</b></span></label>
+              <label class="chk"><input type="checkbox" id="twData" checked /><i></i><span>Disable <b>data collection</b> and skip the privacy questions</span></label>
+              <label class="chk"><input type="checkbox" id="twBitlocker" /><i></i><span>Prevent automatic <b>BitLocker</b> device encryption</span></label>
+              <label class="chk"><input type="checkbox" id="twQol" /><i></i><span>Remove <b>OneDrive</b>, <b>Copilot</b>, <b>Teams</b>, ads and News</span></label>
+              <div class="chk-inline">
+                <label class="chk"><input type="checkbox" id="twUser" /><i></i><span>Create a local account</span></label>
+                <input class="tin" id="twUserName" type="text" placeholder="username" disabled autocomplete="off" spellcheck="false" />
+              </div>
+            </div>
+            <button class="linkbtn" id="previewBtn">Preview answer file</button>
+            <pre class="log xmlprev" id="xmlPreview" hidden></pre>
+          </div>
+        </section>
+
         <button class="flash-btn" id="flashBtn" disabled>FLASH</button>
         <p class="warn">⚠ This permanently erases everything on the selected drive.</p>
 

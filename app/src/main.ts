@@ -21,6 +21,65 @@ const flashBtn = $<HTMLButtonElement>("flashBtn");
 const progPanel = $("progPanel");
 const progFill = $("progFill");
 const logEl = $("log");
+const wueCard = $("wueCard");
+const twUser = $<HTMLInputElement>("twUser");
+const twUserName = $<HTMLInputElement>("twUserName");
+const xmlPreview = $("xmlPreview");
+
+/** The Windows User Experience options, shaped for the Rust `TweaksDto`. */
+function currentTweaks() {
+  const on = (id: string) => $<HTMLInputElement>(id).checked;
+  const hw = on("twBypassHw");
+  const extra = on("twBypassExtra");
+  const account = twUser.checked ? twUserName.value.trim() : "";
+  return {
+    bypassTpm: hw,
+    bypassSecureBoot: hw,
+    bypassRam: hw,
+    bypassCpu: extra,
+    bypassStorage: extra,
+    skipMsAccount: on("twSkipMsa"),
+    localAccount: account || null,
+    localPassword: null,
+    disableDataCollection: on("twData"),
+    disableBitlocker: on("twBitlocker"),
+    qol: on("twQol"),
+    region: null,
+    timezone: null,
+  };
+}
+
+/** Short human summary of the enabled tweaks, for the confirm dialog. */
+function tweakSummary(): string[] {
+  const t = currentTweaks();
+  const out: string[] = [];
+  if (t.bypassTpm) out.push("Bypass TPM 2.0 / Secure Boot / RAM checks");
+  if (t.bypassCpu) out.push("Bypass CPU / disk checks");
+  if (t.skipMsAccount) out.push("No Microsoft account required");
+  if (t.disableDataCollection) out.push("Data collection disabled");
+  if (t.disableBitlocker) out.push("BitLocker auto-encryption prevented");
+  if (t.qol) out.push("OneDrive / Copilot / Teams removed");
+  if (t.localAccount) out.push(`Local account: ${t.localAccount}`);
+  return out;
+}
+
+twUser.addEventListener("change", () => {
+  twUserName.disabled = !twUser.checked;
+  if (twUser.checked) twUserName.focus();
+});
+
+$("previewBtn").addEventListener("click", async () => {
+  if (!xmlPreview.hidden) {
+    xmlPreview.hidden = true;
+    return;
+  }
+  try {
+    xmlPreview.textContent = await invoke<string>("preview_unattend", { tweaks: currentTweaks() });
+  } catch (e) {
+    xmlPreview.textContent = "Error: " + e;
+  }
+  xmlPreview.hidden = false;
+});
 
 async function refreshDevices() {
   devSelect.innerHTML = `<option value="">Scanning…</option>`;
@@ -65,6 +124,9 @@ $("browseBtn").addEventListener("click", async () => {
     isoKindEl.className = "chip " + (win ? "chip-win" : "chip-lin");
     optMode.textContent = win ? "Windows" : "Linux / direct";
     optFs.textContent = win ? "FAT32 + WIM split" : "Direct image write";
+    // The Windows tweaks only apply to a Windows installer.
+    wueCard.hidden = !win;
+    xmlPreview.hidden = true;
   } catch (e) {
     isoKindEl.textContent = String(e);
   }
@@ -78,7 +140,10 @@ function updateFlash() {
 flashBtn.addEventListener("click", async () => {
   if (!isoPath || !deviceById) return;
   const name = devSelect.selectedOptions[0]?.textContent || "the selected drive";
-  if (!confirm(`This will PERMANENTLY ERASE:\n\n${name}\n\nEverything on it will be lost. Continue?`)) return;
+  const win = isoKind === "windows";
+  const extras = win ? tweakSummary() : [];
+  const extraText = extras.length ? `\n\nWindows tweaks:\n• ${extras.join("\n• ")}` : "";
+  if (!confirm(`This will PERMANENTLY ERASE:\n\n${name}\n\nEverything on it will be lost.${extraText}\n\nContinue?`)) return;
   flashing = true;
   flashBtn.disabled = true;
   flashBtn.textContent = "FLASHING…";
@@ -86,7 +151,12 @@ flashBtn.addEventListener("click", async () => {
   logEl.textContent = "";
   setProgress(null);
   try {
-    await invoke("flash", { device: deviceById, iso: isoPath, kind: isoKind });
+    await invoke("flash", {
+      device: deviceById,
+      iso: isoPath,
+      kind: isoKind,
+      tweaks: win ? currentTweaks() : null,
+    });
   } catch (e) {
     appendLog("ERROR: " + e);
     finish(false);

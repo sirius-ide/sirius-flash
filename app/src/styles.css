@@ -71,6 +71,32 @@ body {
 .opt span { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
 .opt b { font-size: 13.5px; }
 
+/* ---- Windows User Experience checkboxes ---- */
+.wue { display: flex; flex-direction: column; gap: 9px; margin-top: 10px; }
+.chk { display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 13px; line-height: 1.35; }
+.chk input { position: absolute; opacity: 0; width: 0; height: 0; }
+.chk i {
+  flex: none; width: 17px; height: 17px; border-radius: 5px;
+  border: 1px solid rgba(255,255,255,0.22); background: rgba(0,0,0,0.3);
+  display: grid; place-items: center; transition: .15s;
+}
+.chk i::after { content: "✓"; font-size: 11px; font-weight: 800; color: #04121a; opacity: 0; transition: .15s; }
+.chk input:checked + i { background: linear-gradient(135deg, var(--cyan), var(--cyan-2)); border-color: var(--cyan); box-shadow: 0 0 10px var(--glow); }
+.chk input:checked + i::after { opacity: 1; }
+.chk input:focus-visible + i { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(56,224,255,0.25); }
+.chk:hover i { border-color: rgba(56,224,255,0.5); }
+.chk b { color: var(--cyan); font-weight: 600; }
+.chk-inline { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.chk-inline .chk { flex: none; }
+.tin { flex: 1; min-width: 120px; padding: 7px 11px; border-radius: 9px; background: rgba(0,0,0,0.35);
+  border: 1px solid var(--card-brd); color: var(--txt); font-size: 13px; user-select: text; }
+.tin:focus { outline: none; border-color: var(--cyan); }
+.tin:disabled { opacity: .35; cursor: not-allowed; }
+.linkbtn { margin-top: 12px; background: none; border: none; color: var(--cyan); font-size: 12.5px;
+  cursor: pointer; padding: 0; text-decoration: underline; text-underline-offset: 3px; font-weight: 600; }
+.linkbtn:hover { color: #fff; }
+.xmlprev { max-height: 220px; margin-top: 10px; }
+
 .flash-btn {
   margin-top: 6px; padding: 16px; border-radius: 14px; border: none; cursor: pointer;
   font-size: 17px; font-weight: 800; letter-spacing: 1px; color: #04121a;
