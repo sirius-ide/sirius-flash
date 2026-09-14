@@ -594,6 +594,20 @@ fn pick_install_image(sources_dir: &Path) -> Option<(String, u64)> {
 /// `tweaks`, when present, is written to the USB as `autounattend.xml` — this is
 /// what bypasses the Windows 11 TPM / Secure Boot / RAM checks and the
 /// Microsoft-account requirement.
+/// Where the single partition the Windows path creates begins.
+///
+/// `parted ... mkpart WIN11 fat32 1MiB 100%` — so the filesystem never spans
+/// the whole drive, and a plan validated against the drive size is describing a
+/// volume 1 MiB larger than the one that gets created. That matters at a
+/// cluster-size band boundary, where it can pick a size the real volume does
+/// not allow.
+pub const WINDOWS_PARTITION_START: u64 = 1024 * 1024;
+
+/// The size of the volume the Windows path will actually format.
+pub fn windows_volume_size(device_size: u64) -> u64 {
+    device_size.saturating_sub(WINDOWS_PARTITION_START)
+}
+
 /// What this build can actually turn into bootable Windows media.
 ///
 /// The options model in [`format`] describes the whole of Rufus's panel; this
@@ -653,19 +667,27 @@ pub fn flash_windows_iso(
                 label: "WIN11USB".into(),
                 quick: true,
             }
-            .validate(format::Volume::new(d.size_bytes, d.sector_size))?;
+            .validate(format::Volume::new(
+                windows_volume_size(d.size_bytes),
+                d.sector_size,
+            ))?;
             &default_plan
         }
     };
     // A plan is proof that a combination is valid — for the drive it was
     // checked against. It carries that drive's geometry, so a plan built
     // elsewhere would silently format with the wrong cluster arithmetic.
-    if plan.volume().sector_size != d.sector_size {
+    let expected = format::Volume::new(windows_volume_size(d.size_bytes), d.sector_size);
+    if plan.volume() != expected {
         bail!(
-            "this format plan was checked against {} byte sectors but {} reports {}",
+            "this format plan was checked against a {:.1} GiB volume with {} byte sectors, \
+             but {} will produce {:.1} GiB with {} byte sectors — a plan is only proof for \
+             the drive it was checked against",
+            plan.volume().size_bytes as f64 / 1024.0_f64.powi(3),
             plan.volume().sector_size,
             d.dev.display(),
-            d.sector_size
+            expected.size_bytes as f64 / 1024.0_f64.powi(3),
+            expected.sector_size
         );
     }
     assert_buildable(plan)?;
@@ -703,10 +725,9 @@ pub fn flash_windows_iso(
     // split: splitting turns one oversized file into `.swm` chunks of much the
     // same total size, so it saves no space at all.
     let content_bytes = blockio::tree_size(Path::new(iso_mnt))?;
-    const PARTITION_START: u64 = 1024 * 1024;
     // FAT32 metadata is roughly 0.1% of the volume; 1% is a safe margin that
     // still refuses only genuinely hopeless cases.
-    let usable = (d.size_bytes.saturating_sub(PARTITION_START) as f64 * 0.99) as u64;
+    let usable = (windows_volume_size(d.size_bytes) as f64 * 0.99) as u64;
     if content_bytes > usable {
         let _ = Command::new("umount").arg(iso_mnt).status();
         bail!(
@@ -1135,6 +1156,30 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.to_string().contains("not yet verified"), "got: {err}");
+    }
+
+    /// The filesystem goes on a partition that starts 1 MiB in, so it is
+    /// smaller than the drive — and at a cluster-size band boundary that
+    /// difference changes the answer. A 32 GiB drive is past FAT32's 32 GB
+    /// threshold while its partition is not, so validating against the drive
+    /// would pick a cluster set the real volume does not allow.
+    #[test]
+    fn the_plan_describes_the_partition_not_the_drive() {
+        use format::*;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let drive = 32 * GIB;
+        let partition = windows_volume_size(drive);
+        assert_eq!(partition, drive - WINDOWS_PARTITION_START);
+
+        let by_drive = cluster_sizes(FileSystem::Fat32, Volume::new(drive, 512));
+        let by_partition = cluster_sizes(FileSystem::Fat32, Volume::new(partition, 512));
+        assert_ne!(
+            by_drive, by_partition,
+            "32 GiB is exactly where the two disagree; if this ever stops being \
+             true the test has lost its point"
+        );
+        assert_eq!(by_drive, vec![16384, 32768, 65536]);
+        assert!(by_partition.contains(&8192), "the partition allows smaller");
     }
 
     #[test]

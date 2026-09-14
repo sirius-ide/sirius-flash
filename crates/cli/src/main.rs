@@ -424,7 +424,10 @@ fn main() -> Result<()> {
 
             match k {
                 core::IsoKind::Windows => {
-                    let plan = format.to_plan(d.size_bytes, d.sector_size)?;
+                    // The volume is the partition, not the whole drive — the
+                    // core checks that the plan matches what it will create.
+                    let plan =
+                        format.to_plan(core::windows_volume_size(d.size_bytes), d.sector_size)?;
                     core::flash_windows_iso(
                         &d,
                         &iso,
