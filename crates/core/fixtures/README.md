@@ -7,6 +7,11 @@ array. Everything here is a **real archive**, not a hand-assembled one.
 |---|---|---|
 | `lzw-width-growth.Z` | Unix `compress` stream whose codes widen 9 → 10 → 11 → 12 | LZW encoder, output verified with GNU `gzip -dc` |
 | `lzw-dictionary-full.Z` | the same payload at `maxbits=10`, so the dictionary saturates and then stays frozen | as above |
+| `fixed.vhd` | fixed-size VHD: 34816 bytes of payload plus the 512-byte `conectix` footer | `qemu-img convert -f raw -O vpc -o subformat=fixed` |
+| `dynamic.vhd` | dynamic VHD, which we must refuse rather than write | `qemu-img create -f vpc -o subformat=dynamic` |
+
+The VHDs are files rather than inline arrays because qemu rounds a fixed VHD up
+to CHS geometry, so 35 kB is the smallest one that exists.
 
 The payload of both is `(i * 167 + 13) mod 256` for `i` in `0..n`, which the
 tests regenerate rather than storing a second copy of.

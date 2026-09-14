@@ -700,24 +700,23 @@ pub fn flash_linux_iso(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<()> {
     assert_safe_target(d)?;
-    let size = fs::metadata(iso)
-        .with_context(|| format!("reading {}", iso.display()))?
-        .len();
     let compression = blockio::detect_compression(iso)?;
-    // A compressed image's real size is unknown until it is unpacked, so only
-    // the raw case can be checked up front; the compressed case is caught by
-    // the ENOSPC handling in write_image. Either way this must happen before
-    // anything is wiped rather than partway through the write.
-    if compression == blockio::Compression::None && size > d.size_bytes {
-        bail!(
-            "image is {:.1} GiB but {} holds only {:.1} GiB",
-            size as f64 / 1024.0_f64.powi(3),
-            d.dev.display(),
-            d.size_gib()
-        );
+    // How much actually lands on the device is only knowable up front for the
+    // verbatim formats; a compressed image's real size is not in the container,
+    // so that case is caught by the ENOSPC handling in write_image. Either way
+    // this happens before anything is wiped rather than partway through.
+    if let Some(lands) = blockio::payload_len(iso)? {
+        if lands > d.size_bytes {
+            bail!(
+                "image is {:.1} GiB but {} holds only {:.1} GiB",
+                lands as f64 / 1024.0_f64.powi(3),
+                d.dev.display(),
+                d.size_gib()
+            );
+        }
     }
     if compression != blockio::Compression::None {
-        println!("decompressing {} image on the fly", compression.as_str());
+        println!("writing {} image on the fly", compression.as_str());
     }
     let dev = d.by_id.to_string_lossy().to_string();
     let _ = Command::new("bash")

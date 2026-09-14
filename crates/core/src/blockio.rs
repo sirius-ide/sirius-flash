@@ -94,6 +94,7 @@ pub enum Compression {
     Lzma,
     Zip,
     Lzw,
+    VhdFixed,
 }
 
 impl Compression {
@@ -107,6 +108,7 @@ impl Compression {
             Compression::Lzma => "lzma",
             Compression::Zip => "zip",
             Compression::Lzw => "compress",
+            Compression::VhdFixed => "vhd",
         }
     }
 
@@ -133,6 +135,21 @@ impl Compression {
         } else {
             Compression::None
         }
+    }
+}
+
+impl Compression {
+    /// Was this settled by a magic number, rather than guessed from a header
+    /// that could belong to something else?
+    fn has_magic(self) -> bool {
+        !matches!(self, Compression::None | Compression::Lzma)
+    }
+
+    /// Do the bytes reach the device unchanged, so that the size on disk is
+    /// also the size that lands? True for a raw image, and for a fixed VHD once
+    /// its trailing footer is trimmed.
+    pub fn is_verbatim(self) -> bool {
+        matches!(self, Compression::None | Compression::VhdFixed)
     }
 }
 
@@ -206,14 +223,131 @@ fn read_full(f: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(n)
 }
 
-/// Detect how `path` is compressed.
+/// A VHD hard-disk footer.
+///
+/// Microsoft, *Virtual Hard Disk Image Format Specification* v1.0, 11 October
+/// 2006. Every field is **big-endian**, and the footer sits at the END of the
+/// file — which is why detection cannot be a head sniff like every other
+/// format here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VhdFooter {
+    /// 512, or 511 for images written before Virtual PC 2004.
+    footer_len: u64,
+    disk_type: u32,
+}
+
+impl VhdFooter {
+    const FIXED: u32 = 2;
+    const DYNAMIC: u32 = 3;
+    const DIFFERENCING: u32 = 4;
+    const COOKIE: &'static [u8; 8] = b"conectix";
+
+    /// Ones-complement of the 32-bit wrapping sum of the footer, with the
+    /// checksum field itself read as zero. Straight from the spec's appendix.
+    fn checksum(footer: &[u8]) -> u32 {
+        let mut sum: u32 = 0;
+        for (i, byte) in footer.iter().enumerate() {
+            if (64..68).contains(&i) {
+                continue;
+            }
+            sum = sum.wrapping_add(u32::from(*byte));
+        }
+        !sum
+    }
+
+    /// Parse the last 512 bytes of a file as a footer, if that is what they are.
+    ///
+    /// Four independent conditions must hold — the cookie, the stored checksum,
+    /// a major version of 1, and the reserved feature bit. A raw disk image
+    /// that happens to contain the word "conectix" in its last sector will not
+    /// survive the checksum, so this is not a heuristic in the way the LZMA
+    /// header check is.
+    fn parse_tail(tail: &[u8; 512], file_size: u64) -> Option<VhdFooter> {
+        // Pre-2004 images have a 511-byte footer. The two can never both match:
+        // a 512-byte footer read at -511 starts "onectix", and a 511-byte one
+        // read at -512 starts with a payload byte.
+        let (footer, footer_len) = if tail[..8] == *Self::COOKIE {
+            (&tail[..512], 512u64)
+        } else if tail[1..9] == *Self::COOKIE {
+            (&tail[1..512], 511u64)
+        } else {
+            return None;
+        };
+        if file_size <= footer_len {
+            // A bare footer with no disk behind it is not an image.
+            return None;
+        }
+        let stored = u32::from_be_bytes([footer[64], footer[65], footer[66], footer[67]]);
+        if stored != Self::checksum(footer) {
+            return None;
+        }
+        let version = u32::from_be_bytes([footer[12], footer[13], footer[14], footer[15]]);
+        if version >> 16 != 1 {
+            return None;
+        }
+        let features = u32::from_be_bytes([footer[8], footer[9], footer[10], footer[11]]);
+        if features & 0x2 == 0 {
+            return None;
+        }
+        Some(VhdFooter {
+            footer_len,
+            disk_type: u32::from_be_bytes([footer[60], footer[61], footer[62], footer[63]]),
+        })
+    }
+}
+
+/// Read and validate the trailing VHD footer, if there is one.
+fn vhd_footer(f: &mut File, file_size: u64) -> Result<Option<VhdFooter>> {
+    if file_size < 512 {
+        return Ok(None);
+    }
+    f.seek(SeekFrom::End(-512))?;
+    let mut tail = [0u8; 512];
+    read_full(f, &mut tail)?;
+    Ok(VhdFooter::parse_tail(&tail, file_size))
+}
+
+/// Detect how `path` is encoded.
+///
+/// Layered, and the order is load-bearing. A real magic number wins outright.
+/// Failing that, the VHD footer is checked *before* the LZMA-alone guess,
+/// because a footer is confirmed by a checksum over 512 bytes while the LZMA
+/// header is only a plausibility test — and a VHD's payload begins with
+/// whatever filesystem it holds, which could pass that test.
 pub fn detect_compression(path: &Path) -> Result<Compression> {
     let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     // 16 rather than 8: the LZMA-alone header is 13 bytes and has no magic
     // number, so all of it is needed to tell it from a raw image.
     let mut magic = [0u8; 16];
     let n = read_full(&mut f, &mut magic).with_context(|| format!("reading {}", path.display()))?;
-    Ok(Compression::sniff(&magic[..n]))
+    let head = Compression::sniff(&magic[..n]);
+    if head.has_magic() {
+        return Ok(head);
+    }
+
+    let file_size = f.metadata()?.len();
+    if let Some(footer) = vhd_footer(&mut f, file_size)
+        .with_context(|| format!("reading the trailer of {}", path.display()))?
+    {
+        return match footer.disk_type {
+            VhdFooter::FIXED => Ok(Compression::VhdFixed),
+            // Refused here, at image-selection time, rather than after a target
+            // device has been chosen and wiped.
+            VhdFooter::DYNAMIC => bail!(
+                "{} is a dynamic VHD, which stores its data in scattered blocks. \
+                 Only fixed-size VHDs can be written so far — convert it with \
+                 `qemu-img convert -O vpc -o subformat=fixed`",
+                path.display()
+            ),
+            VhdFooter::DIFFERENCING => bail!(
+                "{} is a differencing VHD, which holds only the changes against \
+                 a parent disk and cannot be written on its own",
+                path.display()
+            ),
+            other => bail!("{} is a VHD of unsupported type {other}", path.display()),
+        };
+    }
+    Ok(head)
 }
 
 /// Counts bytes pulled from the file underneath a decompressor.
@@ -503,7 +637,19 @@ pub fn open_image(path: &Path) -> Result<(Box<dyn Read>, u64, Compression, ByteC
     // counter is attached. Progress is then reported against that member rather
     // than the whole archive, which is what makes it finish at 100%.
     let mut zip_method = zip::CompressionMethod::Stored;
-    let source = if compression == Compression::Zip {
+    let source = if compression == Compression::VhdFixed {
+        // A fixed VHD is a raw disk image with a 512-byte footer bolted on the
+        // end. Writing the footer to the device would append 512 bytes of
+        // metadata past the last sector of the filesystem, so it is trimmed --
+        // and `size` becomes the payload, which keeps progress ending at 100%
+        // rather than at 99.95%.
+        let footer = vhd_footer(&mut file, size)?
+            .with_context(|| format!("re-reading the footer of {}", path.display()))?;
+        size -= footer.footer_len;
+        file.rewind()
+            .with_context(|| format!("rewinding {}", path.display()))?;
+        EitherSource::Member(file.take(size))
+    } else if compression == Compression::Zip {
         let member = locate_zip_member(&mut file, path, size)?;
         file.seek(SeekFrom::Start(member.data_start))
             .with_context(|| format!("seeking to {} in {}", member.name, path.display()))?;
@@ -552,8 +698,34 @@ pub fn open_image(path: &Path) -> Result<(Box<dyn Read>, u64, Compression, ByteC
                 .map_err(|e| anyhow::anyhow!("not a readable lzma image: {e}"))?,
         )),
         Compression::Zstd => Box::new(ZstdFrames::new(counted)?),
+        // Already trimmed to the payload above; the bytes themselves are raw.
+        Compression::VhdFixed => Box::new(counted),
     };
     Ok((reader, size, compression, counter))
+}
+
+/// How many bytes this image will put on the device, when that is knowable
+/// before decoding it.
+///
+/// `None` for anything compressed: the decompressed length is not in the
+/// container, so the only thing that catches an oversized image is ENOSPC
+/// partway through the write. A raw image, and a fixed VHD minus its footer,
+/// can be checked up front — which is the difference between refusing the job
+/// and wiping a drive before finding out.
+pub fn payload_len(path: &Path) -> Result<Option<u64>> {
+    let compression = detect_compression(path)?;
+    if !compression.is_verbatim() {
+        return Ok(None);
+    }
+    let mut f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let size = f.metadata()?.len();
+    Ok(Some(match compression {
+        Compression::VhdFixed => match vhd_footer(&mut f, size)? {
+            Some(footer) => size - footer.footer_len,
+            None => size,
+        },
+        _ => size,
+    }))
 }
 
 /// What a write actually produced.
@@ -662,9 +834,11 @@ pub fn write_image(
         .with_context(|| format!("opening {} for writing", dest.display()))?;
 
     let mut written = 0u64;
-    // Uncompressed input produces exactly as many bytes as it consumes, so the
-    // output count is already the right progress signal.
-    let track = if compression == Compression::None {
+    // Verbatim input produces exactly as many bytes as it consumes, so the
+    // output count is already the right progress signal. Everything else has an
+    // output size that is unknown until the last byte, so progress is reported
+    // against how much of the *input* has been consumed instead.
+    let track = if compression.is_verbatim() {
         None
     } else {
         Some(&counter)
@@ -1427,6 +1601,112 @@ mod tests {
         // before any byte reaches the device, which is the point.
         assert!(write_image(&src, &dst, &mut noop).is_err());
         assert!(std::fs::read(&dst).unwrap().is_empty());
+    }
+
+    // ---- fixed VHD ----
+
+    /// The payload inside `fixtures/fixed.vhd`, regenerated rather than stored
+    /// a second time.
+    fn vhd_pattern() -> Vec<u8> {
+        (0..34816).map(|i| ((i * 167 + 13) % 256) as u8).collect()
+    }
+
+    #[test]
+    fn writes_a_fixed_vhd_without_its_footer() {
+        // A fixed VHD is a raw disk image with 512 bytes of metadata glued to
+        // the end. Those 512 bytes are not part of the disk and must not reach
+        // the device.
+        let src = tmp("vhd-src");
+        let dst = tmp("vhd-dst");
+        std::fs::write(&src, include_bytes!("../fixtures/fixed.vhd")).unwrap();
+        std::fs::write(&dst, b"").unwrap();
+        assert_eq!(detect_compression(&src).unwrap(), Compression::VhdFixed);
+        let o = write_image(&src, &dst, &mut noop).unwrap();
+        assert_eq!(o.bytes_written, 34816, "the footer must be trimmed");
+        assert_eq!(std::fs::read(&dst).unwrap(), vhd_pattern());
+        verify_written(&dst, &o.digest, o.bytes_written, &mut noop).unwrap();
+    }
+
+    #[test]
+    fn vhd_progress_ends_at_the_payload_not_the_file() {
+        // Counting the footer would park the bar at 99.95% forever.
+        let src = tmp("vhd-prog-src");
+        let dst = tmp("vhd-prog-dst");
+        std::fs::write(&src, include_bytes!("../fixtures/fixed.vhd")).unwrap();
+        std::fs::write(&dst, b"").unwrap();
+        let mut seen: Vec<Progress> = Vec::new();
+        write_image(&src, &dst, &mut |p| seen.push(p)).unwrap();
+        let last = seen.last().unwrap();
+        assert_eq!(last.bytes, last.total);
+        assert_eq!(last.total, 34816);
+        assert!((last.percent() - 100.0).abs() < 0.001);
+    }
+
+    /// A dynamic VHD stores its data in scattered blocks behind a block
+    /// allocation table, so writing it verbatim produces a drive full of
+    /// metadata. It is refused during detection — before a target has even been
+    /// chosen, let alone wiped.
+    #[test]
+    fn a_dynamic_vhd_is_refused_at_detection() {
+        let src = tmp("vhd-dyn-src");
+        std::fs::write(&src, include_bytes!("../fixtures/dynamic.vhd")).unwrap();
+        let err = detect_compression(&src).unwrap_err();
+        assert!(err.to_string().contains("dynamic VHD"), "got: {err}");
+    }
+
+    #[test]
+    fn the_footer_checksum_is_what_rules_out_a_lookalike() {
+        // Every other field can be forged by accident; the checksum is what
+        // makes a false positive on a raw image implausible.
+        let real = include_bytes!("../fixtures/fixed.vhd");
+        let mut tail = [0u8; 512];
+        tail.copy_from_slice(&real[real.len() - 512..]);
+        assert!(VhdFooter::parse_tail(&tail, real.len() as u64).is_some());
+
+        // Flip one bit anywhere outside the checksum field and it stops parsing.
+        for at in [0usize, 8, 60, 100, 300, 511] {
+            let mut broken = tail;
+            broken[at] ^= 0x01;
+            assert!(
+                VhdFooter::parse_tail(&broken, real.len() as u64).is_none(),
+                "a footer with byte {at} corrupted must not be accepted"
+            );
+        }
+
+        // A file that is nothing but a footer is not an image.
+        assert!(VhdFooter::parse_tail(&tail, 512).is_none());
+    }
+
+    /// Images written before Virtual PC 2004 carry a 511-byte footer. Derived
+    /// from the real one by dropping its final reserved zero, which is exactly
+    /// what those images lack — and which leaves the checksum unchanged.
+    #[test]
+    fn a_legacy_511_byte_footer_is_recognised() {
+        let real = include_bytes!("../fixtures/fixed.vhd");
+        let genuine = &real[real.len() - 512..];
+        assert_eq!(genuine[511], 0, "the dropped byte must be reserved padding");
+
+        let mut tail = [0u8; 512];
+        tail[1..512].copy_from_slice(&genuine[..511]);
+        tail[0] = 0x5a; // the last byte of payload, whatever it happens to be
+        let footer = VhdFooter::parse_tail(&tail, 35327).expect("511-byte footer");
+        assert_eq!(footer.footer_len, 511);
+        assert_eq!(footer.disk_type, VhdFooter::FIXED);
+    }
+
+    /// Detection order: a magic number wins outright, and the checksum-verified
+    /// footer is consulted before the magic-less LZMA guess.
+    #[test]
+    fn a_compressed_vhd_is_treated_as_compressed() {
+        // gzip's magic must win over any trailer the compressed bytes happen to
+        // end with, or we would try to trim a footer off an archive.
+        assert_eq!(Compression::sniff(&[0x1f, 0x8b, 0x08]), Compression::Gzip);
+        assert!(Compression::Gzip.has_magic());
+        assert!(!Compression::None.has_magic());
+        assert!(!Compression::Lzma.has_magic());
+        assert!(Compression::VhdFixed.is_verbatim());
+        assert!(Compression::None.is_verbatim());
+        assert!(!Compression::Gzip.is_verbatim());
     }
 
     #[test]
