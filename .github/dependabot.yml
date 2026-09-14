@@ -1,0 +1,32 @@
+version: 2
+updates:
+  # Core workspace (CLI + core crate)
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # The Tauri app keeps its own lockfile outside the workspace.
+  - package-ecosystem: cargo
+    directory: "/app/src-tauri"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    ignore:
+      # glib 0.18 is pinned transitively by gtk 0.18 <- tauri 2.x, so no
+      # standalone bump can succeed; Dependabot retried and failed on every
+      # push. Tracked as an accepted risk in SECURITY.md and revisited when
+      # Tauri adopts the gtk-rs 0.20 stack.
+      - dependency-name: glib
+
+  - package-ecosystem: npm
+    directory: "/app"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
