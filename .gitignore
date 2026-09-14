@@ -12,3 +12,26 @@ app/dist/
 app/node_modules/
 app/src-tauri/target/
 app/src-tauri/gen/
+
+# Credentials — never commit these (push protection is the backstop, not the plan)
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+.env.*
+secrets.*
+
+# Disk images and Windows install payloads (huge, and often machine-specific)
+*.img
+*.vhd
+*.vhdx
+*.wim
+*.esd
+*.swm
+
+# Editor / OS local state
+.vscode/
+.idea/
+*.swp
+Thumbs.db
