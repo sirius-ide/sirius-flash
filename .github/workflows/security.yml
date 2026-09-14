@@ -19,5 +19,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
-      - name: Check dependencies against the RustSec advisory database
+      - name: Audit the core workspace
         run: cargo audit
+
+      # The Tauri app is excluded from the workspace and carries its own
+      # lockfile, so the scan above never saw it. Dependabot found a real
+      # advisory in there that we were blind to.
+      #
+      # RUSTSEC-2024-0429 is an unsoundness in glib's VariantStrIter. glib 0.18
+      # is pinned transitively by gtk 0.18 <- tauri 2.x, so it cannot be moved
+      # until Tauri adopts the gtk-rs 0.20 stack; we do not call the affected
+      # API. Documented in SECURITY.md and revisited on every Tauri bump.
+      - name: Audit the Tauri app
+        run: cargo audit --file app/src-tauri/Cargo.lock --ignore RUSTSEC-2024-0429
