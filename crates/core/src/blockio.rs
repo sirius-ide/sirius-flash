@@ -363,6 +363,8 @@ struct ZipMember {
     /// a corrupt member from reading into whatever follows it.
     compressed_size: u64,
     method: zip::CompressionMethod,
+    /// Checked because the raw scan below does not decrypt.
+    encrypted: bool,
     name: String,
 }
 
@@ -370,23 +372,40 @@ struct ZipMember {
 /// **uncompressed**.
 ///
 /// Uncompressed is the size that matters — it is what lands on the device, and
-/// a disk image is nearly always highly compressible, so ranking by compressed
-/// size happily picks a small incompressible README over the 4 GB image next
-/// to it.
+/// a disk image compresses far better than the README, signature or checksum
+/// file packed beside it, so ranking by size on disk reliably picks the wrong
+/// entry.
 ///
-/// The archive is only read to locate the member; it is dropped before any
-/// payload is streamed, which is what keeps the returned reader owned rather
-/// than borrowed from it.
-fn locate_zip_member(path: &Path) -> Result<ZipMember> {
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+/// (Rufus's bled takes the *first* member rather than the largest. That is a
+/// deliberate divergence, not an oversight: on an archive whose image sits
+/// second, the first-member rule writes the README.)
+///
+/// The scan uses `by_index_raw`, which reads the central directory without
+/// building a decoder for each entry. `by_index` would construct a real
+/// decryptor and decompressor per entry, so a single sibling the crate cannot
+/// handle — one encrypted note, one bzip2-compressed README — aborts the whole
+/// archive even though the image beside it is perfectly writable. The cost is
+/// that `by_index_raw` will happily stream ciphertext, so the chosen member is
+/// checked for encryption explicitly below.
+///
+/// Only the central directory is read here; the archive is dropped before any
+/// payload streams, which is what lets the returned reader be owned rather than
+/// borrowed from it.
+fn locate_zip_member(file: &mut File, path: &Path, file_len: u64) -> Result<ZipMember> {
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| anyhow::anyhow!("not a readable zip image: {e}"))?;
+    if archive.is_empty() {
+        bail!(
+            "{} is an empty zip — there is no image inside it to write",
+            path.display()
+        );
+    }
 
     let mut best: Option<(u64, ZipMember)> = None;
     for i in 0..archive.len() {
         let entry = archive
-            .by_index(i)
-            .map_err(|e| anyhow::anyhow!("reading zip entry {i}: {e}"))?;
+            .by_index_raw(i)
+            .map_err(|e| anyhow::anyhow!("reading the index of {}: {e}", path.display()))?;
         if entry.is_dir() {
             continue;
         }
@@ -397,26 +416,72 @@ fn locate_zip_member(path: &Path) -> Result<ZipMember> {
         {
             continue;
         }
-        let Some(data_start) = entry.data_start() else {
-            continue;
-        };
+        let name = entry.name().to_string();
+        // Absent only if the local header was never located. Skipping the entry
+        // would quietly fall back to a smaller member and write the wrong
+        // payload, so this is fatal.
+        let data_start = entry
+            .data_start()
+            .with_context(|| format!("{name} in {} has no local header", path.display()))?;
         best = Some((
             size,
             ZipMember {
                 data_start,
                 compressed_size: entry.compressed_size(),
                 method: entry.compression(),
-                name: entry.name().to_string(),
+                encrypted: entry.encrypted(),
+                name,
             },
         ));
     }
 
-    let Some((_, member)) = best else {
+    let Some((size, member)) = best else {
         bail!(
-            "{} holds no files — an empty zip has no image to write",
+            "{} holds only directories — there is no image inside it to write",
             path.display()
         );
     };
+
+    // `by_index_raw` does not decrypt, and would hand us ciphertext to write to
+    // the device verbatim.
+    if member.encrypted {
+        bail!(
+            "{} in {} is encrypted, and Sirius Flash cannot unlock it",
+            member.name,
+            path.display()
+        );
+    }
+    if !matches!(
+        member.method,
+        zip::CompressionMethod::Stored | zip::CompressionMethod::Deflated
+    ) {
+        // Display, not Debug: with only the deflate feature enabled, Debug
+        // renders bzip2 as `Unsupported(12)` while Display names it.
+        bail!(
+            "{} in {} is {}-compressed, which is not supported inside a zip \
+             — re-pack it as deflate or store",
+            member.name,
+            path.display(),
+            member.method
+        );
+    }
+    // A truncated archive would otherwise be discovered by the decoder partway
+    // through the write, with the drive already half-overwritten.
+    let end = member.data_start.saturating_add(member.compressed_size);
+    if end > file_len {
+        bail!(
+            "{} is truncated: {} needs {end} bytes but the file is {file_len}",
+            path.display(),
+            member.name
+        );
+    }
+    if size == 0 {
+        bail!(
+            "{} in {} is empty — there is nothing to write",
+            member.name,
+            path.display()
+        );
+    }
     Ok(member)
 }
 
@@ -439,19 +504,7 @@ pub fn open_image(path: &Path) -> Result<(Box<dyn Read>, u64, Compression, ByteC
     // than the whole archive, which is what makes it finish at 100%.
     let mut zip_method = zip::CompressionMethod::Stored;
     let source = if compression == Compression::Zip {
-        let member = locate_zip_member(path)?;
-        if !matches!(
-            member.method,
-            zip::CompressionMethod::Stored | zip::CompressionMethod::Deflated
-        ) {
-            bail!(
-                "{} in {} is {:?}-compressed, which is not supported inside a zip \
-                 — re-pack it as deflate or store",
-                member.name,
-                path.display(),
-                member.method
-            );
-        }
+        let member = locate_zip_member(&mut file, path, size)?;
         file.seek(SeekFrom::Start(member.data_start))
             .with_context(|| format!("seeking to {} in {}", member.name, path.display()))?;
         size = member.compressed_size;
@@ -1086,6 +1139,66 @@ mod tests {
         0x04, 0x07, 0x00, 0x6d, 0x20, 0xd7, 0x73,
     ];
 
+    /// A real `zip` holding a 4096-byte image next to a small *encrypted*
+    /// note. The image is perfectly writable; only the sibling is locked.
+    const ZIP_ENCRYPTED_SIBLING: &[u8] = &[
+        0x50, 0x4b, 0x03, 0x04, 0x0a, 0x00, 0x09, 0x00, 0x00, 0x00, 0x88, 0x6b, 0x2e, 0x5d, 0x67,
+        0x45, 0x26, 0xd7, 0x19, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x09, 0x00, 0x1c, 0x00,
+        0x6e, 0x6f, 0x74, 0x65, 0x73, 0x2e, 0x74, 0x78, 0x74, 0x55, 0x54, 0x09, 0x00, 0x03, 0x1f,
+        0xb0, 0xa7, 0x6a, 0x1f, 0xb0, 0xa7, 0x6a, 0x75, 0x78, 0x0b, 0x00, 0x01, 0x04, 0xe8, 0x03,
+        0x00, 0x00, 0x04, 0xe8, 0x03, 0x00, 0x00, 0x9c, 0x35, 0x0c, 0x7d, 0x26, 0x5e, 0x5b, 0x4a,
+        0x20, 0x30, 0xae, 0xb1, 0x07, 0xc1, 0x80, 0xa9, 0x39, 0x1c, 0xef, 0xa8, 0xb8, 0xaa, 0x4e,
+        0x7b, 0xd8, 0x50, 0x4b, 0x07, 0x08, 0x67, 0x45, 0x26, 0xd7, 0x19, 0x00, 0x00, 0x00, 0x0d,
+        0x00, 0x00, 0x00, 0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x02, 0x00, 0x08, 0x00, 0x88, 0x6b,
+        0x2e, 0x5d, 0x11, 0x00, 0x1c, 0xc7, 0x14, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x09,
+        0x00, 0x1c, 0x00, 0x69, 0x6d, 0x61, 0x67, 0x65, 0x2e, 0x69, 0x6d, 0x67, 0x55, 0x54, 0x09,
+        0x00, 0x03, 0x1f, 0xb0, 0xa7, 0x6a, 0x1f, 0xb0, 0xa7, 0x6a, 0x75, 0x78, 0x0b, 0x00, 0x01,
+        0x04, 0xe8, 0x03, 0x00, 0x00, 0x04, 0xe8, 0x03, 0x00, 0x00, 0xed, 0xc1, 0x01, 0x0d, 0x00,
+        0x00, 0x00, 0xc2, 0xa0, 0xf7, 0x4f, 0x6d, 0x0f, 0x07, 0x14, 0x00, 0x00, 0x00, 0xf0, 0x6e,
+        0x50, 0x4b, 0x01, 0x02, 0x1e, 0x03, 0x0a, 0x00, 0x09, 0x00, 0x00, 0x00, 0x88, 0x6b, 0x2e,
+        0x5d, 0x67, 0x45, 0x26, 0xd7, 0x19, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x09, 0x00,
+        0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xa4, 0x81, 0x00, 0x00, 0x00,
+        0x00, 0x6e, 0x6f, 0x74, 0x65, 0x73, 0x2e, 0x74, 0x78, 0x74, 0x55, 0x54, 0x05, 0x00, 0x03,
+        0x1f, 0xb0, 0xa7, 0x6a, 0x75, 0x78, 0x0b, 0x00, 0x01, 0x04, 0xe8, 0x03, 0x00, 0x00, 0x04,
+        0xe8, 0x03, 0x00, 0x00, 0x50, 0x4b, 0x01, 0x02, 0x1e, 0x03, 0x14, 0x00, 0x02, 0x00, 0x08,
+        0x00, 0x88, 0x6b, 0x2e, 0x5d, 0x11, 0x00, 0x1c, 0xc7, 0x14, 0x00, 0x00, 0x00, 0x00, 0x10,
+        0x00, 0x00, 0x09, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa4,
+        0x81, 0x6c, 0x00, 0x00, 0x00, 0x69, 0x6d, 0x61, 0x67, 0x65, 0x2e, 0x69, 0x6d, 0x67, 0x55,
+        0x54, 0x05, 0x00, 0x03, 0x1f, 0xb0, 0xa7, 0x6a, 0x75, 0x78, 0x0b, 0x00, 0x01, 0x04, 0xe8,
+        0x03, 0x00, 0x00, 0x04, 0xe8, 0x03, 0x00, 0x00, 0x50, 0x4b, 0x05, 0x06, 0x00, 0x00, 0x00,
+        0x00, 0x02, 0x00, 0x02, 0x00, 0x9e, 0x00, 0x00, 0x00, 0xc3, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// A real `zip` whose largest member is itself encrypted, so there is
+    /// nothing we can legitimately write.
+    const ZIP_ENCRYPTED_LARGEST: &[u8] = &[
+        0x50, 0x4b, 0x03, 0x04, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x6b, 0x2e, 0x5d, 0xc9,
+        0x97, 0xb8, 0x50, 0x04, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x09, 0x00, 0x1c, 0x00,
+        0x73, 0x6d, 0x61, 0x6c, 0x6c, 0x2e, 0x74, 0x78, 0x74, 0x55, 0x54, 0x09, 0x00, 0x03, 0x1f,
+        0xb0, 0xa7, 0x6a, 0x1f, 0xb0, 0xa7, 0x6a, 0x75, 0x78, 0x0b, 0x00, 0x01, 0x04, 0xe8, 0x03,
+        0x00, 0x00, 0x04, 0xe8, 0x03, 0x00, 0x00, 0x74, 0x69, 0x6e, 0x79, 0x50, 0x4b, 0x03, 0x04,
+        0x14, 0x00, 0x0b, 0x00, 0x08, 0x00, 0x88, 0x6b, 0x2e, 0x5d, 0x11, 0x00, 0x1c, 0xc7, 0x20,
+        0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x0a, 0x00, 0x1c, 0x00, 0x73, 0x65, 0x63, 0x72,
+        0x65, 0x74, 0x2e, 0x69, 0x6d, 0x67, 0x55, 0x54, 0x09, 0x00, 0x03, 0x1f, 0xb0, 0xa7, 0x6a,
+        0x1f, 0xb0, 0xa7, 0x6a, 0x75, 0x78, 0x0b, 0x00, 0x01, 0x04, 0xe8, 0x03, 0x00, 0x00, 0x04,
+        0xe8, 0x03, 0x00, 0x00, 0x56, 0xf2, 0x6d, 0x7a, 0x64, 0xdd, 0x4b, 0x5f, 0xf2, 0x58, 0x44,
+        0x72, 0x0c, 0x45, 0x90, 0x2c, 0x64, 0x7e, 0xea, 0xd9, 0x60, 0x75, 0x56, 0x77, 0xe3, 0xbe,
+        0xc1, 0x4e, 0xe4, 0x1c, 0xa4, 0x60, 0x50, 0x4b, 0x07, 0x08, 0x11, 0x00, 0x1c, 0xc7, 0x20,
+        0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x50, 0x4b, 0x01, 0x02, 0x1e, 0x03, 0x0a, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x88, 0x6b, 0x2e, 0x5d, 0xc9, 0x97, 0xb8, 0x50, 0x04, 0x00, 0x00,
+        0x00, 0x04, 0x00, 0x00, 0x00, 0x09, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0xa4, 0x81, 0x00, 0x00, 0x00, 0x00, 0x73, 0x6d, 0x61, 0x6c, 0x6c, 0x2e, 0x74,
+        0x78, 0x74, 0x55, 0x54, 0x05, 0x00, 0x03, 0x1f, 0xb0, 0xa7, 0x6a, 0x75, 0x78, 0x0b, 0x00,
+        0x01, 0x04, 0xe8, 0x03, 0x00, 0x00, 0x04, 0xe8, 0x03, 0x00, 0x00, 0x50, 0x4b, 0x01, 0x02,
+        0x1e, 0x03, 0x14, 0x00, 0x0b, 0x00, 0x08, 0x00, 0x88, 0x6b, 0x2e, 0x5d, 0x11, 0x00, 0x1c,
+        0xc7, 0x20, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x0a, 0x00, 0x18, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa4, 0x81, 0x47, 0x00, 0x00, 0x00, 0x73, 0x65, 0x63,
+        0x72, 0x65, 0x74, 0x2e, 0x69, 0x6d, 0x67, 0x55, 0x54, 0x05, 0x00, 0x03, 0x1f, 0xb0, 0xa7,
+        0x6a, 0x75, 0x78, 0x0b, 0x00, 0x01, 0x04, 0xe8, 0x03, 0x00, 0x00, 0x04, 0xe8, 0x03, 0x00,
+        0x00, 0x50, 0x4b, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x9f, 0x00,
+        0x00, 0x00, 0xbb, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
     fn roundtrip(tag: &str, blob: &[u8], expect: Compression) {
         let src = tmp(&format!("c-{tag}-src"));
         let dst = tmp(&format!("c-{tag}-dst"));
@@ -1215,7 +1328,7 @@ mod tests {
         std::fs::write(&dst, b"").unwrap();
         assert_eq!(detect_compression(&src).unwrap(), Compression::Zip);
         let err = write_image(&src, &dst, &mut noop).unwrap_err();
-        assert!(err.to_string().contains("no files"), "got: {err}");
+        assert!(err.to_string().contains("empty zip"), "got: {err}");
     }
 
     /// ruzstd 0.9 began applying its 100 MB default window cap to the first
@@ -1263,6 +1376,57 @@ mod tests {
             assert_eq!(o.bytes_written, expected.len() as u64, "{tag}");
             verify_written(&dst, &o.digest, o.bytes_written, &mut noop).unwrap();
         }
+    }
+
+    /// The index scan must not build a decoder for every entry. It used to,
+    /// so one locked note beside the image aborted the whole archive with
+    /// "Password required to decrypt file" — an archive we can read perfectly
+    /// well, refused over a member we never intended to touch.
+    #[test]
+    fn a_locked_sibling_does_not_block_the_image() {
+        let src = tmp("zip-encsib-src");
+        let dst = tmp("zip-encsib-dst");
+        std::fs::write(&src, ZIP_ENCRYPTED_SIBLING).unwrap();
+        std::fs::write(&dst, b"").unwrap();
+        let o = write_image(&src, &dst, &mut noop).unwrap();
+        assert_eq!(o.bytes_written, 4096);
+        assert_eq!(std::fs::read(&dst).unwrap(), vec![0u8; 4096]);
+    }
+
+    /// The flip side: reading the index raw means the crate no longer refuses
+    /// encrypted members for us, so an encrypted *winner* must be caught here.
+    /// Left unchecked it would be streamed to the device as ciphertext.
+    #[test]
+    fn an_encrypted_image_is_refused_not_written_as_ciphertext() {
+        let src = tmp("zip-enclrg-src");
+        let dst = tmp("zip-enclrg-dst");
+        std::fs::write(&src, ZIP_ENCRYPTED_LARGEST).unwrap();
+        std::fs::write(&dst, b"").unwrap();
+        let err = write_image(&src, &dst, &mut noop).unwrap_err();
+        assert!(err.to_string().contains("encrypted"), "got: {err}");
+        assert!(
+            std::fs::read(&dst).unwrap().is_empty(),
+            "nothing may reach the device"
+        );
+    }
+
+    /// A truncated archive must be caught while reading the index, not by the
+    /// decoder partway through the write with the drive already overwritten.
+    #[test]
+    fn a_truncated_zip_is_caught_before_writing() {
+        let src = tmp("zip-trunc-src");
+        let dst = tmp("zip-trunc-dst");
+        // Keep the central directory (so it still parses) but drop payload
+        // bytes out of the middle by shrinking the file's declared extent.
+        let mut blob = ZIP_DEFLATED.to_vec();
+        let cut = blob.len() - 4;
+        blob.truncate(cut);
+        std::fs::write(&src, &blob).unwrap();
+        std::fs::write(&dst, b"").unwrap();
+        // Either the index fails to parse or the extent check fires; both are
+        // before any byte reaches the device, which is the point.
+        assert!(write_image(&src, &dst, &mut noop).is_err());
+        assert!(std::fs::read(&dst).unwrap().is_empty());
     }
 
     #[test]
