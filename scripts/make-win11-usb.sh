@@ -3,9 +3,16 @@
 # Target is addressed ONLY via /dev/disk/by-id serial path, with asserts before any write.
 set -euo pipefail
 
-DEV="/dev/disk/by-id/usb-Kingston_DataTraveler_3.0_60A44C3FAD9EFEB1398E00D2-0:0"
-ISO="/run/media/emrys/DATA8TB/Win11_25H2_English_x64_v2.iso"
-LOG="/tmp/w11usb.log"
+#
+# Usage:
+#   DEV=/dev/disk/by-id/usb-<Vendor>_<Model>_<Serial>-0:0 \
+#   ISO=/path/to/Win11.iso \
+#   sudo -E ./make-win11-usb.sh
+#
+# Find the by-id path with:  ls -l /dev/disk/by-id/usb-*
+DEV="${DEV:?set DEV to the target /dev/disk/by-id/usb-... path — see ls /dev/disk/by-id/usb-*}"
+ISO="${ISO:?set ISO to the path of the Windows 11 .iso}"
+LOG="${LOG:-/tmp/w11usb.log}"
 
 exec > >(tee "$LOG") 2>&1
 echo "=== $(date) starting ==="
