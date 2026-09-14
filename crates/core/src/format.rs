@@ -107,13 +107,28 @@ impl FileSystem {
         matches!(self, FileSystem::Fat32)
     }
 
-    /// Longest volume label the filesystem records.
+    /// Longest volume label the filesystem records, **in the unit that
+    /// filesystem counts**.
+    ///
+    /// This is not the same unit for all three, and the difference is not
+    /// academic: exFAT stores the label as UTF-16, so `mkfs.exfat` rejects an
+    /// 11-*character* label made of astral or accented characters with "input
+    /// string is too long". FAT32 counts characters — `BS_VolLab` is eleven OEM
+    /// code points and `mkfs.fat` measures with `mbstowcs` before converting.
     pub fn max_label_len(self) -> usize {
         match self {
-            // 11 bytes in the boot sector's BS_VolLab / a directory entry.
-            FileSystem::Fat32 | FileSystem::ExFat => 11,
+            // Eleven OEM code points in BS_VolLab.
+            FileSystem::Fat32 => 11,
+            // Eleven UTF-16 code units in the volume-label directory entry.
+            FileSystem::ExFat => 11,
+            // Thirty-two UTF-16 code units.
             FileSystem::Ntfs => 32,
         }
+    }
+
+    /// Is the label length counted in UTF-16 code units rather than characters?
+    fn counts_label_in_utf16(self) -> bool {
+        matches!(self, FileSystem::Ntfs | FileSystem::ExFat)
     }
 
     /// Does the filesystem store labels folded to upper case?
@@ -281,6 +296,37 @@ impl FormatPlan {
     /// a drive that silently does not boot, so the flasher refuses instead.
     pub fn needs_boot_code(&self) -> bool {
         matches!(self.target, TargetSystem::Bios | TargetSystem::BiosOrUefi)
+    }
+
+    /// Can *this build* actually produce bootable media for this plan?
+    ///
+    /// [`needs_boot_code`](Self::needs_boot_code) answers a narrower question,
+    /// and a plan can clear it and still be unbuildable — MBR + UEFI needs no
+    /// bootstrap yet is declined for want of a way to boot-test it. This is the
+    /// single authority on the whole gap between what the model can describe
+    /// and what we can make, so that the flasher and anything listing options
+    /// cannot drift apart and quietly promise different things.
+    ///
+    /// `Ok(())` means we would produce media that boots.
+    pub fn buildable(&self) -> Result<(), &'static str> {
+        if self.needs_boot_code() {
+            return Err(
+                "BIOS media needs an MBR bootstrap and a partition boot record, which \
+                 this build does not write",
+            );
+        }
+        if self.filesystem != FileSystem::Fat32 {
+            return Err(
+                "UEFI firmware only reads FAT, so this would need a filesystem driver \
+                 loaded before boot",
+            );
+        }
+        if self.scheme != PartitionScheme::Gpt {
+            return Err(
+                "MBR with a UEFI target is a valid layout but is not yet boot-verified here",
+            );
+        }
+        Ok(())
     }
 }
 
@@ -508,12 +554,33 @@ pub fn sanitise_label(fs: FileSystem, label: &str) -> (String, bool) {
         out = out.to_uppercase();
     }
     out = out.trim().to_string();
-    // Truncate by characters, not bytes, so a multi-byte character is never
-    // cut in half. FAT is already ASCII by this point, so the two agree there;
-    // for NTFS and exFAT the limit really is a character count.
-    if out.chars().count() > fs.max_label_len() {
-        out = out.chars().take(fs.max_label_len()).collect();
-        out = out.trim_end().to_string();
+    // Truncate in the unit the filesystem actually counts, always on a
+    // character boundary so a multi-byte character is never cut in half.
+    // FAT32 is already ASCII here, where the two units agree; exFAT and NTFS
+    // store UTF-16, and an accented or astral character costs one or two units
+    // there while costing one character.
+    let limit = fs.max_label_len();
+    let too_long = if fs.counts_label_in_utf16() {
+        out.chars().map(char::len_utf16).sum::<usize>() > limit
+    } else {
+        out.chars().count() > limit
+    };
+    if too_long {
+        let mut kept = String::new();
+        let mut used = 0usize;
+        for c in out.chars() {
+            let cost = if fs.counts_label_in_utf16() {
+                c.len_utf16()
+            } else {
+                1
+            };
+            if used + cost > limit {
+                break;
+            }
+            used += cost;
+            kept.push(c);
+        }
+        out = kept.trim_end().to_string();
     }
     let changed = out != label;
     (out, changed)
@@ -1047,5 +1114,45 @@ mod floor_tests {
         for fs in [FileSystem::Ntfs, FileSystem::ExFat, FileSystem::Fat32] {
             assert!(!cluster_sizes(fs, Volume::new(2 * GB, 512)).is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod label_unit_tests {
+    use super::*;
+
+    /// exFAT and NTFS store the label as UTF-16 and count code units, so an
+    /// eleven-*character* accented label is twenty-two units and `mkfs.exfat`
+    /// refuses it with "input string is too long". Measured against
+    /// exfatprogs, not inferred.
+    #[test]
+    fn utf16_filesystems_are_truncated_in_code_units() {
+        let eleven_accents = "ÉÉÉÉÉÉÉÉÉÉÉ"; // 11 chars, 11 UTF-16 units
+        let (got, _) = sanitise_label(FileSystem::ExFat, eleven_accents);
+        assert_eq!(
+            got.chars().map(char::len_utf16).sum::<usize>(),
+            11,
+            "{got:?} must fit eleven UTF-16 units"
+        );
+
+        // Astral characters cost two units each, so only five fit.
+        let rockets = "🚀🚀🚀🚀🚀🚀🚀🚀";
+        let (got, _) = sanitise_label(FileSystem::ExFat, rockets);
+        let units: usize = got.chars().map(char::len_utf16).sum();
+        assert!(units <= 11, "{got:?} is {units} UTF-16 units");
+        assert_eq!(got.chars().count(), 5, "five surrogate pairs fit, not more");
+
+        let (got, _) = sanitise_label(FileSystem::Ntfs, &"🚀".repeat(20));
+        let units: usize = got.chars().map(char::len_utf16).sum();
+        assert!(units <= 32, "{got:?} is {units} UTF-16 units");
+    }
+
+    /// FAT32 counts characters, not units — and after the ASCII fold the two
+    /// agree anyway, so nothing over-truncates.
+    #[test]
+    fn fat32_still_counts_characters() {
+        let (got, _) = sanitise_label(FileSystem::Fat32, "SÉCURITÉ");
+        assert_eq!(got, "S_CURIT_", "all eight fit; none is dropped");
+        assert_eq!(got.chars().count(), 8);
     }
 }

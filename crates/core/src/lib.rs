@@ -566,6 +566,14 @@ pub fn detect_iso_kind(iso: &Path) -> Result<IsoKind> {
 fn run(cmd: &str, args: &[&str]) -> Result<()> {
     let status = Command::new(cmd)
         .args(args)
+        // Helper tools are run in a predictable UTF-8 locale rather than
+        // whatever we inherited. Under pkexec the environment is reset, and in
+        // the bare `C` locale `mkfs.exfat` refuses any non-ASCII volume label
+        // with "invalid character sequence in current locale" — after `parted`
+        // has already run. Which labels work should not depend on how the tool
+        // was launched. (FAT32 is a separate matter: it converts through CP850
+        // in every locale, which is why its labels are folded to ASCII.)
+        .env("LC_ALL", "C.UTF-8")
         .status()
         .with_context(|| format!("failed to spawn `{cmd}`"))?;
     if !status.success() {
@@ -594,6 +602,44 @@ fn pick_install_image(sources_dir: &Path) -> Option<(String, u64)> {
 /// `tweaks`, when present, is written to the USB as `autounattend.xml` — this is
 /// what bypasses the Windows 11 TPM / Secure Boot / RAM checks and the
 /// Microsoft-account requirement.
+/// The removable-media bootloader names UEFI firmware looks for, one per
+/// architecture.
+///
+/// UEFI §3.5.1.1: with no boot entry, firmware appends
+/// `\EFI\BOOT\BOOT{machine type short-name}.EFI`. Assuming `bootx64.efi`
+/// silently excludes every ARM64 Windows ISO, which carries `bootaa64.efi`.
+#[cfg(target_os = "linux")]
+const EFI_BOOT_NAMES: [&str; 6] = [
+    "bootx64.efi",
+    "bootaa64.efi",
+    "bootia32.efi",
+    "bootarm.efi",
+    "bootia64.efi",
+    "bootriscv64.efi",
+];
+
+/// Find the removable-media bootloader in a mounted tree, whatever its
+/// architecture and whatever case the filesystem reports.
+///
+/// ISO9660 and UDF disagree about case, and FAT does not preserve it, so both
+/// the directory walk and the name match are case-insensitive.
+#[cfg(target_os = "linux")]
+fn find_efi_bootloader(root: &Path) -> Option<PathBuf> {
+    let efi = child_ignoring_case(root, "efi")?;
+    let boot = child_ignoring_case(&efi, "boot")?;
+    EFI_BOOT_NAMES
+        .iter()
+        .find_map(|n| child_ignoring_case(&boot, n))
+}
+
+/// One directory entry matching `name` without regard to case.
+#[cfg(target_os = "linux")]
+fn child_ignoring_case(dir: &Path, name: &str) -> Option<PathBuf> {
+    fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+        (e.file_name().to_string_lossy().to_lowercase() == name.to_lowercase()).then(|| e.path())
+    })
+}
+
 /// Where the single partition the Windows path creates begins.
 ///
 /// `parted ... mkpart WIN11 fat32 1MiB 100%` — so the filesystem never spans
@@ -615,31 +661,14 @@ pub fn windows_volume_size(device_size: u64) -> u64 {
 /// refused here rather than formatted into a drive that silently will not boot.
 #[cfg(target_os = "linux")]
 fn assert_buildable(plan: &format::FormatPlan) -> Result<()> {
-    if plan.needs_boot_code() {
-        bail!(
-            "a {} target needs an MBR bootstrap and a partition boot record, which this \
-             build does not write yet — the drive would format and then not boot. Target \
-             UEFI instead.",
-            plan.target().as_str()
-        );
-    }
-    if plan.filesystem() != format::FileSystem::Fat32 {
-        bail!(
-            "Windows installation media must be FAT32 here: UEFI firmware is only obliged \
-             to read FAT, and booting {} would need an NTFS driver loaded first",
+    plan.buildable().map_err(|why| {
+        anyhow::anyhow!(
+            "this build cannot make bootable {} + {} + {} media: {why}",
+            plan.scheme().as_str().to_uppercase(),
+            plan.target().as_str(),
             plan.filesystem()
-        );
-    }
-    if plan.scheme() != format::PartitionScheme::Gpt {
-        // MBR + UEFI + FAT32 is a real and common layout, but we have no way to
-        // boot-test it here, and an unverified boot path is how a user ends up
-        // with media that formats cleanly and does nothing.
-        bail!(
-            "only GPT is supported for Windows media so far; MBR with a UEFI target is \
-             valid but is not yet verified here"
-        );
-    }
-    Ok(())
+        )
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -712,6 +741,25 @@ pub fn flash_windows_iso(
         None => {
             let _ = Command::new("umount").arg(iso_mnt).status();
             bail!("not a Windows installer: neither sources/install.wim nor sources/install.esd is present");
+        }
+    };
+
+    // Which bootloader does this ISO actually carry? An ARM64 Windows ISO has
+    // `bootaa64.efi`, not `bootx64.efi`. Finding that out after the copy — which
+    // is where the check used to be — means the drive is already wiped and the
+    // installer already written before we notice. Invariant 1.
+    let boot_name = match find_efi_bootloader(Path::new(iso_mnt)) {
+        Some(p) => p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default(),
+        None => {
+            let _ = Command::new("umount").arg(iso_mnt).status();
+            bail!(
+                "{} has no \\EFI\\BOOT bootloader, so UEFI firmware would have nothing to \
+                 start — it cannot be made into bootable media this way",
+                iso.display()
+            );
         }
     };
 
@@ -819,8 +867,8 @@ pub fn flash_windows_iso(
                 }
             }
         }
-        if !Path::new(&format!("{usb_mnt}/efi/boot/bootx64.efi")).exists() {
-            bail!("verification failed: efi/boot/bootx64.efi missing on USB");
+        if find_efi_bootloader(Path::new(usb_mnt)).is_none() {
+            bail!("verification failed: efi/boot/{boot_name} missing on USB");
         }
         if !Path::new(&format!("{usb_mnt}/sources/boot.wim")).exists() {
             bail!("verification failed: sources/boot.wim missing on USB");
@@ -1147,6 +1195,10 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.to_string().contains("MBR bootstrap"), "got: {err}");
+        assert!(
+            err.to_string().contains("MBR + bios"),
+            "the message must name the combination: {err}"
+        );
 
         // MBR + UEFI is a real layout but is not boot-verified here.
         let err = assert_buildable(&plan(
@@ -1155,7 +1207,10 @@ mod tests {
             FileSystem::Fat32,
         ))
         .unwrap_err();
-        assert!(err.to_string().contains("not yet verified"), "got: {err}");
+        assert!(
+            err.to_string().contains("not yet boot-verified"),
+            "got: {err}"
+        );
     }
 
     /// The filesystem goes on a partition that starts 1 MiB in, so it is

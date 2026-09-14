@@ -184,11 +184,8 @@ fn show_format_options(size_bytes: u64, sector_size: u32) -> Result<()> {
                         .collect::<Vec<_>>()
                         .join(" ")
                 );
-                if plan.needs_boot_code() {
-                    println!(
-                        "        not yet: BIOS media needs an MBR bootstrap and a partition \
-                         boot record, which this build does not write"
-                    );
+                if let Err(why) = plan.buildable() {
+                    println!("        not yet: {why}");
                 }
                 for w in plan.warnings() {
                     println!("        note: {w}");
