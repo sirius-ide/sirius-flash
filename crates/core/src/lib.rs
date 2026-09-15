@@ -1264,6 +1264,10 @@ pub fn detect_iso_kind(_iso: &Path) -> Result<IsoKind> {
     bail!("ISO detection not yet implemented on this OS")
 }
 #[cfg(not(target_os = "linux"))]
+pub fn windows_install_image_size(_iso: &Path) -> Result<u64> {
+    bail!("ISO inspection not yet implemented on this OS")
+}
+#[cfg(not(target_os = "linux"))]
 pub fn flash_windows_iso(
     _d: &UsbDevice,
     _iso: &Path,
