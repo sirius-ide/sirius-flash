@@ -748,7 +748,7 @@ pub fn partition_for_layout_for_test(
 /// that we cannot rebuild, and it goes to the drive verbatim, so it is verified
 /// every time rather than trusted because it was right at build time.
 #[cfg(target_os = "linux")]
-fn write_uefi_ntfs(part: &str) -> Result<()> {
+fn verify_uefi_ntfs_image() -> Result<()> {
     use sha2::{Digest, Sha256};
     let digest = blockio::hex(&Sha256::digest(UEFI_NTFS_IMAGE));
     if digest != UEFI_NTFS_SHA256 {
@@ -757,6 +757,14 @@ fn write_uefi_ntfs(part: &str) -> Result<()> {
              refusing to write a loader we cannot vouch for"
         );
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_uefi_ntfs(part: &str) -> Result<()> {
+    // Checked again here rather than trusting the preflight: this is the call
+    // that actually puts bytes on the device.
+    verify_uefi_ntfs_image()?;
     let mut out = fs::OpenOptions::new()
         .write(true)
         .open(part)
@@ -765,6 +773,80 @@ fn write_uefi_ntfs(part: &str) -> Result<()> {
         .with_context(|| format!("writing the UEFI:NTFS loader to {part}"))?;
     out.flush().context("flushing the loader partition")?;
     out.sync_all().context("syncing the loader partition")?;
+    Ok(())
+}
+
+/// The size of the install image inside a Windows ISO, without writing
+/// anything.
+///
+/// Exists so a caller can work out which layout will be used — and therefore
+/// what to warn about — *before* asking the user to confirm. The warning is the
+/// only thing we do here that Rufus does not, and printing it after the
+/// confirmation prompt would waste it entirely.
+#[cfg(target_os = "linux")]
+pub fn windows_install_image_size(iso: &Path) -> Result<u64> {
+    let iso_mnt = "/run/sirius-flash-inspect";
+    fs::create_dir_all(iso_mnt)?;
+    run("mount", &["-o", "loop,ro", &iso.to_string_lossy(), iso_mnt])?;
+    let found = pick_install_image(Path::new(&format!("{iso_mnt}/sources")));
+    let _ = Command::new("umount").arg(iso_mnt).status();
+    match found {
+        Some((_, size)) => Ok(size),
+        None => bail!(
+            "not a Windows installer: neither sources/install.wim nor sources/install.esd \
+             is present in {}",
+            iso.display()
+        ),
+    }
+}
+
+/// Can this host actually mount what `mkfs.ntfs` is about to produce?
+///
+/// `mkfs.ntfs` is pure userspace — it succeeds on a kernel with no NTFS support
+/// at all — so finding it on PATH says nothing about whether the volume can
+/// then be mounted and written to. Getting this wrong wipes the drive and fails
+/// at the mount, several steps past the point of no return.
+///
+/// Neither cheap substitute answers the question. Looking for `mount.ntfs` or
+/// ntfs-3g does not: modern util-linux resolves a `TYPE=ntfs` volume to fstype
+/// `ntfs3` and calls the kernel directly, so ntfs-3g is never consulted.
+/// Reading `/proc/filesystems` does not either: `ntfs3` is autoloaded on
+/// demand, so a host that mounts NTFS perfectly well lists nothing until the
+/// first mount asks for it.
+///
+/// So the probe is the real thing: make a tiny NTFS filesystem and mount it.
+#[cfg(target_os = "linux")]
+fn probe_ntfs_mountable() -> Result<()> {
+    let dir = std::env::temp_dir().join("sirius-flash-ntfs-probe");
+    let img = dir.join("probe.img");
+    let mnt = dir.join("mnt");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&mnt).context("creating the NTFS probe directory")?;
+    let cleanup = || {
+        let _ = Command::new("umount").arg(&mnt).status();
+        let _ = fs::remove_dir_all(&dir);
+    };
+
+    // The smallest volume mkfs.ntfs will make, so the probe costs nothing.
+    let f = fs::File::create(&img).context("creating the NTFS probe image")?;
+    f.set_len(8 * 1024 * 1024)
+        .context("sizing the NTFS probe image")?;
+    drop(f);
+    let img_s = img.to_string_lossy().to_string();
+    if run("mkfs.ntfs", &["-Q", "-F", "-L", "PROBE", &img_s]).is_err() {
+        cleanup();
+        bail!("`mkfs.ntfs` cannot create a filesystem on this host");
+    }
+    let mnt_s = mnt.to_string_lossy().to_string();
+    let mounted = run("mount", &["-o", "loop", &img_s, &mnt_s]).is_ok();
+    cleanup();
+    if !mounted {
+        bail!(
+            "this host can create an NTFS filesystem but cannot mount one, so the installer \
+             files could not be copied onto it. Install ntfs-3g, or load the kernel's ntfs3 \
+             module, or use `--layout fat32-split`. Nothing has been written to the drive."
+        );
+    }
     Ok(())
 }
 
@@ -849,54 +931,27 @@ pub fn flash_windows_iso(
     d: &UsbDevice,
     iso: &Path,
     tweaks: Option<&WindowsTweaks>,
-    format: Option<&format::FormatPlan>,
+    format: Option<&format::FormatRequest>,
     layout: Option<format::WindowsLayout>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<()> {
     assert_safe_target(d)?;
 
-    // Everything about the format is settled here, while the drive is still
-    // intact — invariant 1. A plan we cannot build must fail now, not after
-    // `parted` has run.
-    let default_plan;
-    let plan = match format {
-        Some(p) => p,
-        None => {
-            default_plan = format::FormatRequest {
-                scheme: format::PartitionScheme::Gpt,
-                target: format::TargetSystem::Uefi,
-                filesystem: format::FileSystem::Fat32,
-                cluster_size: None,
-                label: "WIN11USB".into(),
-                quick: true,
-            }
-            .validate(format::Volume::new(
-                windows_volume_size(d.size_bytes),
-                d.sector_size,
-            ))?;
-            &default_plan
-        }
-    };
-    // A plan is proof that a combination is valid — for the drive it was
-    // checked against. It carries that drive's geometry, so a plan built
-    // elsewhere would silently format with the wrong cluster arithmetic.
-    let expected = format::Volume::new(windows_volume_size(d.size_bytes), d.sector_size);
-    if plan.volume() != expected {
-        bail!(
-            "this format plan was checked against a {:.1} GiB volume with {} byte sectors, \
-             but {} will produce {:.1} GiB with {} byte sectors — a plan is only proof for \
-             the drive it was checked against",
-            plan.volume().size_bytes as f64 / 1024.0_f64.powi(3),
-            plan.volume().sector_size,
-            d.dev.display(),
-            expected.size_bytes as f64 / 1024.0_f64.powi(3),
-            expected.sector_size
-        );
-    }
-    assert_buildable(plan)?;
-    for w in plan.warnings() {
-        println!("note: {w}");
-    }
+    // A *request*, not a plan. Which filesystem this ends up being depends on
+    // the layout, and the layout depends on how big the install image is, which
+    // is not known until the ISO has been probed. Validating before then could
+    // only ever assert FAT32 — and would then assert it about media we were
+    // about to make NTFS.
+    let request = format.cloned().unwrap_or(format::FormatRequest {
+        scheme: format::PartitionScheme::Gpt,
+        target: format::TargetSystem::Uefi,
+        // Overwritten from the layout below; the layout is the authority.
+        filesystem: format::FileSystem::Fat32,
+        cluster_size: None,
+        label: "WIN11USB".into(),
+        quick: true,
+        uefi_ntfs_helper: false,
+    });
 
     let dev = d.by_id.to_string_lossy().to_string();
     let part1 = format!("{dev}-part1");
@@ -926,6 +981,31 @@ pub fn flash_windows_iso(
     if let Some(caveat) = layout.caveat() {
         println!("note: {caveat}");
     }
+
+    // Now the layout is known, the request can become a plan. The layout
+    // chooses the filesystem and declares whether a loader partition is coming,
+    // because those two together are what make NTFS legal under a UEFI target.
+    let mut request = request;
+    request.filesystem = layout.filesystem();
+    request.uefi_ntfs_helper = layout.needs_uefi_ntfs_partition();
+    let plan = match request.validate(format::Volume::new(
+        windows_volume_size(d.size_bytes),
+        d.sector_size,
+    )) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = Command::new("umount").arg(iso_mnt).status();
+            return Err(e);
+        }
+    };
+    if let Err(e) = assert_buildable(&plan) {
+        let _ = Command::new("umount").arg(iso_mnt).status();
+        return Err(e);
+    }
+    for w in plan.warnings() {
+        println!("note: {w}");
+    }
+    let plan = &plan;
 
     // Which bootloader does this ISO actually carry? An ARM64 Windows ISO has
     // `bootaa64.efi`, not `bootx64.efi`. Finding that out after the copy — which
@@ -986,6 +1066,16 @@ pub fn flash_windows_iso(
         let _ = Command::new("umount").arg(iso_mnt).status();
         return Err(e);
     }
+    if layout == format::WindowsLayout::NtfsUefiNtfs {
+        // Both of these can only fail usefully while the drive is intact: the
+        // mount probe because mkfs.ntfs existing proves nothing about mounting,
+        // and the hash because a loader we cannot vouch for must never reach a
+        // device — least of all after the partition table has been replaced.
+        if let Err(e) = probe_ntfs_mountable().and_then(|()| verify_uefi_ntfs_image()) {
+            let _ = Command::new("umount").arg(iso_mnt).status();
+            return Err(e);
+        }
+    }
 
     // ---- everything from here on is destructive ----
     let _ = Command::new("bash")
@@ -1019,13 +1109,24 @@ pub fn flash_windows_iso(
                 run("mkfs.fat", &mkfs)?;
             }
             format::WindowsLayout::NtfsUefiNtfs => {
-                // -Q is a quick format; -F skips the "this looks mounted"
-                // heuristics, which misfire on a device we have just
-                // repartitioned.
-                let mut mkfs = vec!["-Q", "-F", "-L", plan.label()];
-                if !plan.quick() {
-                    // ntfs-3g spells the surface scan differently to dosfstools.
-                    mkfs.retain(|a| *a != "-Q");
+                // `-F` is --force: run even though the target "is not a block
+                // special device, or appears to be mounted", which is the state
+                // a just-repartitioned device can look like. `-Q` is --quick:
+                // "skip both zeroing of the volume and bad sector checking".
+                //
+                // So dropping -Q for a full format means something much heavier
+                // here than on FAT32, where the equivalent is a read-only scan:
+                // mkfs.ntfs zeroes the entire volume first, which on a large
+                // stick takes as long as writing the image and reports no
+                // progress while it does.
+                let mut mkfs = vec!["-F", "-L", plan.label()];
+                if plan.quick() {
+                    mkfs.push("-Q");
+                } else {
+                    println!(
+                        "full format: zeroing the volume and checking for bad sectors — \
+                         this takes a while and reports nothing until it finishes"
+                    );
                 }
                 mkfs.push(&part1);
                 run("mkfs.ntfs", &mkfs)?;
@@ -1167,7 +1268,7 @@ pub fn flash_windows_iso(
     _d: &UsbDevice,
     _iso: &Path,
     _tweaks: Option<&WindowsTweaks>,
-    _format: Option<&format::FormatPlan>,
+    _format: Option<&format::FormatRequest>,
     _layout: Option<format::WindowsLayout>,
     _on_progress: &mut dyn FnMut(Progress),
 ) -> Result<()> {
@@ -1387,6 +1488,7 @@ mod tests {
             cluster_size: None,
             label: "SIRIUS".into(),
             quick: true,
+            uefi_ntfs_helper: false,
         }
         .validate(format::Volume::new(32 * 1024 * 1024 * 1024, 512))
         .expect("the combination itself is legal")

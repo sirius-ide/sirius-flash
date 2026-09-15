@@ -132,13 +132,14 @@ fn parse_cluster_size(s: &str) -> Result<u32> {
 }
 
 impl FormatArgs {
-    /// Turn the flags into a checked plan for this drive, or `None` to let the
-    /// core pick its defaults.
-    fn to_plan(
-        &self,
-        device_size: u64,
-        sector_size: u32,
-    ) -> Result<Option<core::format::FormatPlan>> {
+    /// Turn the flags into a format *request*, or `None` to let the core pick
+    /// its defaults.
+    ///
+    /// Deliberately not validated here. The filesystem depends on the layout,
+    /// the layout depends on the size of the install image, and that is not
+    /// known until the core has probed the ISO. Validating now could only
+    /// assert FAT32 — about media the core might be about to make NTFS.
+    fn to_request(&self) -> Result<Option<core::format::FormatRequest>> {
         if self.label.is_none() && self.cluster_size.is_none() && !self.full_format {
             return Ok(None);
         }
@@ -146,18 +147,16 @@ impl FormatArgs {
             Some(c) => Some(parse_cluster_size(c)?),
             None => None,
         };
-        let request = core::format::FormatRequest {
+        Ok(Some(core::format::FormatRequest {
             scheme: core::format::PartitionScheme::Gpt,
             target: core::format::TargetSystem::Uefi,
+            // Both are set from the resolved layout inside the core.
             filesystem: core::format::FileSystem::Fat32,
+            uefi_ntfs_helper: false,
             cluster_size,
             label: self.label.clone().unwrap_or_else(|| "WIN11USB".into()),
             quick: !self.full_format,
-        };
-        Ok(Some(request.validate(core::format::Volume::new(
-            device_size,
-            sector_size,
-        ))?))
+        }))
     }
 }
 
@@ -188,6 +187,7 @@ fn show_format_options(size_bytes: u64, sector_size: u32) -> Result<()> {
                     cluster_size: None,
                     label: String::new(),
                     quick: true,
+                    uefi_ntfs_helper: false,
                 };
                 // Everything advertised must validate; if it does not, that is a
                 // bug in the model rather than something to print.
@@ -432,6 +432,32 @@ fn main() -> Result<()> {
             }
             println!("This will PERMANENTLY ERASE the target device.");
 
+            // Work out the layout now, so anything it requires of the target
+            // machine is said BEFORE the user commits. Printing it afterwards
+            // would make the warning worthless, which is exactly the trap Rufus
+            // falls into by not printing one at all.
+            let mut chosen_layout = format.layout();
+            if k == core::IsoKind::Windows {
+                if chosen_layout.is_none() {
+                    match core::windows_install_image_size(&iso) {
+                        Ok(size) => {
+                            chosen_layout = Some(core::format::WindowsLayout::default_for(size))
+                        }
+                        // Not fatal here: the flasher probes the ISO properly
+                        // and will fail there with a better message.
+                        Err(e) => eprintln!("warning: could not inspect the image yet: {e}"),
+                    }
+                }
+                if let Some(l) = chosen_layout {
+                    println!("Layout : {}", l.as_str());
+                    if let Some(caveat) = l.caveat() {
+                        println!();
+                        println!("{caveat}");
+                        println!();
+                    }
+                }
+            }
+
             if !yes {
                 print!("Type YES to proceed: ");
                 std::io::stdout().flush()?;
@@ -444,16 +470,18 @@ fn main() -> Result<()> {
 
             match k {
                 core::IsoKind::Windows => {
-                    // The volume is the partition, not the whole drive — the
-                    // core checks that the plan matches what it will create.
-                    let plan =
-                        format.to_plan(core::windows_volume_size(d.size_bytes), d.sector_size)?;
+                    // Unvalidated on purpose: the core resolves the layout
+                    // once it has probed the ISO, and the layout decides the
+                    // filesystem.
+                    let request = format.to_request()?;
                     core::flash_windows_iso(
                         &d,
                         &iso,
                         Some(&tw),
-                        plan.as_ref(),
-                        format.layout(),
+                        request.as_ref(),
+                        // The resolved one, so the core cannot decide
+                        // differently from what the user just agreed to.
+                        chosen_layout,
                         &mut print_progress,
                     )?;
                     println!();
@@ -502,40 +530,41 @@ mod tests {
             full_format: false,
             layout: None,
         };
-        assert!(args
-            .to_plan(32 * 1024 * 1024 * 1024, 512)
-            .unwrap()
-            .is_none());
+        assert!(args.to_request().unwrap().is_none());
     }
 
     #[test]
-    fn format_flags_become_a_checked_plan() {
+    fn format_flags_become_a_request_the_core_will_validate() {
         let args = FormatArgs {
             label: Some("my install".into()),
             cluster_size: Some("32K".into()),
             full_format: true,
             layout: None,
         };
-        let plan = args
-            .to_plan(32 * 1024 * 1024 * 1024, 512)
-            .unwrap()
-            .expect("flags were given");
-        assert_eq!(plan.cluster_size(), 32768);
-        assert_eq!(plan.label(), "MY INSTALL", "FAT32 uppercases and trims");
-        assert!(!plan.quick(), "--full-format asks for the slow one");
+        let request = args.to_request().unwrap().expect("flags were given");
+        assert_eq!(request.cluster_size, Some(32768));
+        assert!(!request.quick, "--full-format asks for the slow one");
+        // The label is sanitised when the request becomes a plan, which cannot
+        // happen until the layout has chosen a filesystem.
+        assert_eq!(request.label, "my install");
     }
 
-    /// A cluster size the drive cannot take is refused here, before anything is
-    /// written, and the message names the sizes that would work.
+    /// A cluster size the drive cannot take is still refused before anything is
+    /// written — but by the core, once the layout has settled the filesystem,
+    /// because which sizes are legal depends on which filesystem it is.
     #[test]
-    fn an_impossible_cluster_size_fails_before_the_drive_is_touched() {
+    fn an_impossible_cluster_size_is_carried_through_to_validation() {
         let args = FormatArgs {
             label: None,
             cluster_size: Some("512".into()),
             full_format: false,
             layout: None,
         };
-        let err = args.to_plan(32 * 1024 * 1024 * 1024, 512).unwrap_err();
+        let request = args.to_request().unwrap().expect("a flag was given");
+        assert_eq!(request.cluster_size, Some(512));
+        let err = request
+            .validate(core::format::Volume::new(32 * 1024 * 1024 * 1024, 512))
+            .unwrap_err();
         assert!(err.to_string().contains("16 KB"), "got: {err}");
     }
 }

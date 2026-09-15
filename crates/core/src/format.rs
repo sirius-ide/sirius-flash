@@ -233,6 +233,13 @@ pub struct FormatRequest {
     /// dying stick. It is a *read* scan, so it does not detect a fake-capacity
     /// counterfeit — those need a write-and-read-back pass.
     pub quick: bool,
+    /// Will a UEFI:NTFS loader partition be written alongside this filesystem?
+    ///
+    /// This is the axis that decides whether NTFS under a UEFI target is legal.
+    /// Firmware reads only FAT, so NTFS is unbootable *unaided* — and the
+    /// loader partition is precisely the aid. Without this the model refuses
+    /// the layout the flasher actually writes by default.
+    pub uefi_ntfs_helper: bool,
 }
 
 /// A [`FormatRequest`] that has been checked against a specific drive.
@@ -248,6 +255,7 @@ pub struct FormatPlan {
     cluster_size: u32,
     label: String,
     quick: bool,
+    uefi_ntfs_helper: bool,
     volume: Volume,
     warnings: Vec<Warning>,
 }
@@ -270,6 +278,10 @@ impl FormatPlan {
     }
     pub fn quick(&self) -> bool {
         self.quick
+    }
+    /// Will a UEFI:NTFS loader partition accompany this filesystem?
+    pub fn uefi_ntfs_helper(&self) -> bool {
+        self.uefi_ntfs_helper
     }
     pub fn volume(&self) -> Volume {
         self.volume
@@ -315,7 +327,7 @@ impl FormatPlan {
                  this build does not write",
             );
         }
-        if self.filesystem != FileSystem::Fat32 {
+        if self.filesystem != FileSystem::Fat32 && !self.uefi_ntfs_helper {
             return Err(
                 "UEFI firmware only reads FAT, so this would need a filesystem driver \
                  loaded before boot",
@@ -616,7 +628,10 @@ impl FormatRequest {
         }
 
         // ---- filesystem ----
-        if self.target.needs_uefi() && !self.filesystem.uefi_bootable_unaided() {
+        if self.target.needs_uefi()
+            && !self.filesystem.uefi_bootable_unaided()
+            && !self.uefi_ntfs_helper
+        {
             bail!(
                 "{} cannot be booted by UEFI firmware on its own — the UEFI specification \
                  requires firmware to implement FAT and nothing else, so {} media needs an \
@@ -682,6 +697,7 @@ impl FormatRequest {
             cluster_size,
             label,
             quick: self.quick,
+            uefi_ntfs_helper: self.uefi_ntfs_helper,
             volume,
             warnings,
         })
@@ -715,6 +731,7 @@ mod tests {
             cluster_size: None,
             label: "SIRIUS".into(),
             quick: true,
+            uefi_ntfs_helper: false,
         }
     }
 
@@ -914,6 +931,7 @@ mod tests {
                                     cluster_size: Some(cluster),
                                     label: "SIRIUS".into(),
                                     quick: true,
+                                    uefi_ntfs_helper: false,
                                 };
                                 r.validate(v).unwrap_or_else(|e| {
                                     panic!(
@@ -992,6 +1010,7 @@ mod capability_tests {
             cluster_size: None,
             label: "SIRIUS".into(),
             quick: true,
+            uefi_ntfs_helper: false,
         }
         .validate(v)
         .unwrap();
@@ -1008,6 +1027,7 @@ mod capability_tests {
                 cluster_size: None,
                 label: "SIRIUS".into(),
                 quick: true,
+                uefi_ntfs_helper: false,
             }
             .validate(v)
             .unwrap();
@@ -1237,6 +1257,14 @@ impl WindowsLayout {
         }
     }
 
+    /// The filesystem this layout puts on the data partition.
+    pub fn filesystem(self) -> FileSystem {
+        match self {
+            WindowsLayout::Fat32Split => FileSystem::Fat32,
+            WindowsLayout::NtfsUefiNtfs => FileSystem::Ntfs,
+        }
+    }
+
     /// Does this layout need the vendored UEFI:NTFS image written to a second
     /// partition?
     pub fn needs_uefi_ntfs_partition(self) -> bool {
@@ -1308,6 +1336,57 @@ mod layout_tests {
             None,
             "this one asks the firmware to trust only the ISO's own bootloader"
         );
+    }
+
+    /// NTFS under a UEFI target is unbootable *unaided* — and the loader
+    /// partition is precisely the aid. Without this axis the model refuses the
+    /// layout the flasher writes by default, which is how the plan ended up
+    /// claiming FAT32 while the drive was being made NTFS.
+    #[test]
+    fn ntfs_under_uefi_is_legal_exactly_when_the_loader_comes_with_it() {
+        let v = Volume::new(32 * GB, 512);
+        let mut r = FormatRequest {
+            scheme: PartitionScheme::Gpt,
+            target: TargetSystem::Uefi,
+            filesystem: FileSystem::Ntfs,
+            cluster_size: None,
+            label: "SIRIUS".into(),
+            quick: true,
+            uefi_ntfs_helper: false,
+        };
+        let err = r.validate(v).unwrap_err();
+        assert!(err.to_string().contains("UEFI specification"), "got: {err}");
+
+        r.uefi_ntfs_helper = true;
+        let plan = r
+            .validate(v)
+            .expect("the loader partition is the driver the message asks for");
+        assert!(plan.uefi_ntfs_helper());
+        plan.buildable()
+            .expect("and it is a layout we can actually write");
+
+        // FAT32 needs no such help, and must not start requiring it.
+        let fat = FormatRequest {
+            filesystem: FileSystem::Fat32,
+            uefi_ntfs_helper: false,
+            ..r.clone()
+        };
+        fat.validate(v)
+            .expect("FAT32 is what firmware reads natively");
+    }
+
+    /// The layout is the authority on the filesystem; they cannot disagree.
+    #[test]
+    fn each_layout_names_its_own_filesystem() {
+        assert_eq!(WindowsLayout::Fat32Split.filesystem(), FileSystem::Fat32);
+        assert_eq!(WindowsLayout::NtfsUefiNtfs.filesystem(), FileSystem::Ntfs);
+        for l in [WindowsLayout::Fat32Split, WindowsLayout::NtfsUefiNtfs] {
+            assert_eq!(
+                l.needs_uefi_ntfs_partition(),
+                l.filesystem() != FileSystem::Fat32,
+                "only the non-FAT layout needs the loader"
+            );
+        }
     }
 
     #[test]
