@@ -3,7 +3,10 @@
 Living handoff document. Anyone (or any new session) picking this up cold should read
 this file first, then `README.md`, then `SECURITY.md`.
 
-**Last updated:** 2026-09-14 · at commit `5bfc482`
+**Last updated:** 2026-09-15. For the commit this describes, ask git —
+`git log -1 --format=%h PROJECT-STATE.md`. A hash written into the file by hand
+names the commit *before* the one containing it, and this one had drifted five
+commits before anyone noticed.
 
 ---
 
@@ -130,6 +133,18 @@ data-loss or dead-stick regression.
 12. **Sizes an archive declares about itself are claims, not facts.** A zip member
     declaring 4 KiB can expand to gigabytes, and deflate reaches ~1000:1. Bound the decoded
     output to the declared length and treat both overrun and shortfall as errors.
+13. **An option the user set must reach the tool that implements it, or be refused.**
+    `--cluster-size` was parsed, validated against the mask, resolved into the plan and
+    printed in the preflight — and then never passed to `mkfs.ntfs`, which defaults to 4096
+    whatever was asked for. Every layer reported success and the volume came out wrong.
+    Accepting an option and dropping it is worse than not offering it: the user's check is
+    that the tool echoed their choice back. Note the two formatters disagree on units —
+    `mkfs.fat -s` counts *sectors*, `mkfs.ntfs -c` counts *bytes*.
+14. **A warning after the decision is not a warning.** Fixed once in the CLI, where the
+    UEFI:NTFS caveat printed below the `Type YES` prompt; it then shipped again in the GUI,
+    which passes `--yes`, so the CLI's copy reached the log pane only once the drive was
+    already being repartitioned. Anything the user might act on belongs in the confirm
+    dialog, and its text comes from `WindowsLayout::caveat()` so the two cannot drift.
 
 ## 5. Conventions
 
@@ -315,14 +330,33 @@ support · bad-block check.
 
 ## 8. Open items
 
-- Dependabot is clear. `actions/checkout@7`, `typescript 7.0.2` and `sha2 0.11.0` merged
-  unchanged; `ruzstd 0.9.0` needed a code change and is committed locally but its PR (#1)
-  is still open on GitHub because these commits have not been pushed. 0.9 moved
+- Dependabot is clear and **no PRs are open**. `actions/checkout@7`, `typescript 7.0.2`
+  and `sha2 0.11.0` merged unchanged. `ruzstd 0.9.0` needed a code change, so it was made
+  here and PR #1 closed — and it did **not** close itself when the push landed: a different
+  commit making the same change is invisible to GitHub, so that had to be done by hand.
+  Expect the same of any future Dependabot PR whose upgrade needs code. 0.9 moved
   `StreamingDecoder` into `ruzstd::decoding` **and** started applying its 100 MB window
   cap to the first frame, which would have silently refused every `zstd --long` image —
   hence `MAX_ZSTD_WINDOW`.
 - `RUSTSEC-2024-0429` (`glib`) is accepted and documented in `SECURITY.md`; it arrives via
   Tauri's GTK stack and has no fixed version reachable from here. Re-check periodically.
+- **The Tauri app was invisible to CI, and that had already cost something.** It is
+  excluded from the Cargo workspace, so `cargo clippy --workspace` and `cargo build
+  --workspace --release` both exit 0 with a hard type error in `app/src-tauri/src/lib.rs`
+  — confirmed by putting one there. Worse, `app/src-tauri/Cargo.lock` had not been
+  refreshed since the core gained its decoders, and `cargo audit --file` can only report
+  on crates the lockfile lists: `zip`, `liblzma`, `ruzstd` and `bzip2` were absent from it
+  while the GUI linked all four through `sirius-flash-core`. `security.yml` was auditing a
+  smaller program than the one we ship. A `gui` job in `ci.yml` now type-checks the
+  frontend and lints the crate, which also keeps that lockfile honest.
+- **The GUI cannot name the Windows layout exactly, only the condition.** Choosing
+  between `Fat32Split` and `NtfsUefiNtfs` needs the size of the largest file in the image,
+  and `windows_install_image_size` gets it by `mount -o loop,ro` — root-only, and the GUI
+  process deliberately has no privileges; only the CLI under `pkexec` does. So the confirm
+  dialog states the trigger ("if this image holds a file larger than 4 GB") rather than the
+  outcome. To make it exact, read the size unprivileged — `7z` already reads UDF for
+  `detect_iso_kind`, so `7z l` is the obvious candidate — and that wants testing against a
+  real Windows ISO, which is not available on this machine.
 - A USB serial and a home path remain in commit `8b95dda`. Deliberately **not** rewritten:
   they are not credentials, and GitHub keeps force-pushed commits reachable by SHA, so a
   rewrite would not remove them. The real remediation — enabling secret scanning, push

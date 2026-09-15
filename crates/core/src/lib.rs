@@ -1119,7 +1119,14 @@ pub fn flash_windows_iso(
                 // mkfs.ntfs zeroes the entire volume first, which on a large
                 // stick takes as long as writing the image and reports no
                 // progress while it does.
-                let mut mkfs = vec!["-F", "-L", plan.label()];
+                //
+                // `-c` is a size in *bytes*, the opposite of `mkfs.fat`'s `-s`,
+                // which counts sectors. Omitting it does not mean "whatever the
+                // plan asked for": mkntfs falls back to 4096 regardless, so the
+                // user's `--cluster-size` was accepted, validated, printed in
+                // the plan, and then silently discarded.
+                let cluster = plan.cluster_size().to_string();
+                let mut mkfs = vec!["-F", "-c", &cluster, "-L", plan.label()];
                 if plan.quick() {
                     mkfs.push("-Q");
                 } else {

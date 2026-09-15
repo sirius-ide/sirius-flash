@@ -42,6 +42,12 @@ struct ImageInfo {
     /// "raw", or the container we will decode on the fly ("gzip", "xz",
     /// "zstd", "bzip2", "lzma", "zip", "compress", "vhd").
     compression: String,
+    /// Short description of the layout this image will get, for the summary
+    /// card.
+    layout: String,
+    /// What that layout costs the user, if anything — taken from core so the
+    /// GUI and the CLI cannot drift apart on the wording.
+    layout_caveat: Option<String>,
 }
 
 #[tauri::command]
@@ -58,9 +64,37 @@ fn detect_iso(path: String) -> Result<ImageInfo, String> {
     } else {
         "other"
     };
+    // Which Windows layout this image gets is decided by the size of the
+    // largest file inside it, and reading that means mounting the ISO, which
+    // needs root. This process deliberately has none — only the CLI, under
+    // pkexec, does. So the GUI cannot say *which* layout it will be and states
+    // the condition instead.
+    //
+    // It has to be said here even so. The CLI prints the exact caveat before
+    // its own confirmation prompt, but the GUI passes `--yes`, and by the time
+    // that line reaches the log pane the user has authenticated to pkexec and
+    // the drive is already being repartitioned. A warning after the decision is
+    // worth nothing, which is the whole reason the CLI prints its one early.
+    let (layout, layout_caveat) = if kind == "windows" {
+        let caveat = format!(
+            "If this image holds a file larger than 4 GB — most Windows 10 and 11 \
+             images do — it will be written as NTFS with a UEFI:NTFS loader.\n\n{}",
+            core::format::WindowsLayout::NtfsUefiNtfs
+                .caveat()
+                .unwrap_or_default()
+        );
+        ("NTFS + UEFI:NTFS, or FAT32 + split", Some(caveat))
+    } else if compression == core::blockio::Compression::None {
+        ("Direct image write", None)
+    } else {
+        ("Unpack + write", None)
+    };
+
     Ok(ImageInfo {
         kind: kind.to_string(),
         compression: compression.as_str().to_string(),
+        layout: layout.to_string(),
+        layout_caveat,
     })
 }
 
@@ -152,7 +186,11 @@ fn resolve_cli() -> Option<String> {
             return Some(p);
         }
     }
-    if let Ok(o) = Command::new("sh").arg("-c").arg("command -v sirius-flash").output() {
+    if let Ok(o) = Command::new("sh")
+        .arg("-c")
+        .arg("command -v sirius-flash")
+        .output()
+    {
         if o.status.success() {
             let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
             if !p.is_empty() {
@@ -240,10 +278,12 @@ fn flash(
         _ => Vec::new(),
     };
     std::thread::spawn(move || {
-        let mut args: Vec<String> = ["write", "--iso", &iso, "--device", &device, "--kind", kind_arg, "--yes"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let mut args: Vec<String> = [
+            "write", "--iso", &iso, "--device", &device, "--kind", kind_arg, "--yes",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         args.extend(tweak_args);
         let spawn = Command::new("pkexec")
             .arg(&cli)

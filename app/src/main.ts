@@ -7,6 +7,10 @@ interface Device { by_id: string; dev: string; model: string; size_gib: number; 
 
 let isoPath = "";
 let isoKind = "auto";
+/** What the chosen layout will cost the user, as core words it. Shown in the
+ * confirm dialog, because the GUI passes `--yes` and the CLI's own copy of this
+ * reaches the log pane only once the drive is already being written. */
+let layoutCaveat: string | null = null;
 let deviceById = "";
 let flashing = false;
 
@@ -128,14 +132,19 @@ $("browseBtn").addEventListener("click", async () => {
   });
   if (!sel || Array.isArray(sel)) return;
   isoPath = sel;
+  layoutCaveat = null;
   isoName.textContent = isoPath.split("/").pop() || isoPath;
   isoMeta.hidden = false;
   isoKindEl.textContent = "detecting…";
   isoKindEl.className = "chip";
   try {
-    const info = await invoke<{ kind: string; compression: string }>("detect_iso", {
-      path: isoPath,
-    });
+    const info = await invoke<{
+      kind: string;
+      compression: string;
+      layout: string;
+      layout_caveat: string | null;
+    }>("detect_iso", { path: isoPath });
+    layoutCaveat = info.layout_caveat;
     isoKind = info.kind;
     const win = isoKind === "windows";
     const packed = info.compression !== "raw";
@@ -148,11 +157,10 @@ $("browseBtn").addEventListener("click", async () => {
         : "Linux / other ISO";
     isoKindEl.className = "chip " + (win ? "chip-win" : "chip-lin");
     optMode.textContent = win ? "Windows" : "Linux / direct";
-    optFs.textContent = win
-      ? "FAT32 + WIM split"
-      : packed
-        ? "Unpack + write"
-        : "Direct image write";
+    // Named by core, not guessed here. This field used to read "FAT32 + WIM
+    // split" for every Windows ISO, which stopped being true when the default
+    // layout became NTFS + UEFI:NTFS.
+    optFs.textContent = info.layout;
     // The Windows tweaks only apply to a Windows installer.
     wueCard.hidden = !win;
     xmlPreview.hidden = true;
@@ -172,7 +180,13 @@ flashBtn.addEventListener("click", async () => {
   const win = isoKind === "windows";
   const extras = win ? tweakSummary() : [];
   const extraText = extras.length ? `\n\nWindows tweaks:\n• ${extras.join("\n• ")}` : "";
-  if (!confirm(`This will PERMANENTLY ERASE:\n\n${name}\n\nEverything on it will be lost.${extraText}\n\nContinue?`)) return;
+  const caveatText = win && layoutCaveat ? `\n\n${layoutCaveat}` : "";
+  if (
+    !confirm(
+      `This will PERMANENTLY ERASE:\n\n${name}\n\nEverything on it will be lost.${extraText}${caveatText}\n\nContinue?`,
+    )
+  )
+    return;
   flashing = true;
   flashBtn.disabled = true;
   flashBtn.textContent = "FLASHING…";
