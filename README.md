@@ -11,7 +11,14 @@ Making a Windows install USB from Linux or macOS is still a trap:
 - **WoeUSB-ng** works but is rough and Linux-only.
 - **macOS** has *nothing* good — no Rufus, no Boot Camp on Apple Silicon.
 
-Sirius Flash does it the correct way, everywhere: GPT + FAT32 + split `install.wim` for maximum UEFI compatibility (Secure Boot stays valid), plain image-write for Linux ISOs, and a clean GUI — with hard safety rails so you can never target the wrong disk.
+Sirius Flash does it the correct way, everywhere: GPT, an NTFS data partition with a
+signed UEFI:NTFS loader beside it when the image needs one, FAT32 with a split
+`install.wim` when it does not, plain image-write for Linux ISOs, and a clean GUI — with
+hard safety rails so you can never target the wrong disk.
+
+Both Windows layouts are offered because neither is right for every machine, and we say
+which you are getting and what it costs **before** you commit to erasing the drive. Rufus
+picks the same default and says nothing.
 
 ## Status
 
@@ -24,9 +31,12 @@ Sirius Flash does it the correct way, everywhere: GPT + FAT32 + split `install.w
 - [x] Windows 11 User Experience — bypass TPM / Secure Boot / RAM / CPU / storage,
       skip the Microsoft account, local admin, no data collection, debloat
 - [x] Tauri GUI (pick ISO → pick USB → flash) — dark themed, branded, live progress
-- [ ] Format options: MBR/GPT, BIOS/UEFI, filesystem, cluster size, volume label
-- [ ] UEFI:NTFS dual-partition layout (removes WIM splitting entirely)
+- [x] Format options: MBR/GPT, BIOS/UEFI, filesystem, cluster size, volume label —
+      modelled as valid combinations, so the core refuses an impossible one
+- [x] UEFI:NTFS dual-partition layout — the default when a file exceeds FAT32's 4 GB limit,
+      with WIM splitting kept as the answer for firmware that will not trust it
 - [x] Image formats — see the table below; detected by content, streamed, never buffered
+- [ ] BIOS boot sectors — our own MBR and FAT32 boot record, not Microsoft's blobs
 - [ ] Built-in ISO downloader (Linux catalogue, then Windows)
 - [ ] macOS backend
 - [ ] Windows backend
