@@ -640,6 +640,22 @@ fn child_ignoring_case(dir: &Path, name: &str) -> Option<PathBuf> {
     })
 }
 
+/// The UEFI:NTFS partition image, vendored from Rufus.
+///
+/// Embedded rather than built, because it cannot be built: its value is the
+/// Microsoft Secure Boot signature on the binaries inside, and only Microsoft
+/// can produce that. See `crates/core/assets/README.md` for the provenance and
+/// the licences of its three upstreams.
+pub const UEFI_NTFS_IMAGE: &[u8] = include_bytes!("../assets/uefi-ntfs.img");
+
+/// What `UEFI_NTFS_IMAGE` must hash to.
+///
+/// Checked before the image is written, not merely at build time: this blob is
+/// the one thing we ship that we cannot rebuild or audit line by line, and it
+/// goes onto a user's drive verbatim.
+pub const UEFI_NTFS_SHA256: &str =
+    "72683fa1250eeea772d3399277b434d4e55ba8dd0dc926e52d817e701fc2eb9e";
+
 /// Is this external tool on PATH?
 ///
 /// Searched by hand rather than by running it: plenty of these have no
@@ -1323,6 +1339,30 @@ mod tests {
         assert!(!tool_exists("this-is-not-on-path-at-all"));
         // A bare path separator must not be treated as a hit.
         assert!(!tool_exists(""));
+    }
+
+    /// The vendored UEFI:NTFS image is the one thing we ship that we cannot
+    /// rebuild, and it is written to a user's drive verbatim. Pin it.
+    #[test]
+    fn the_vendored_uefi_ntfs_image_is_the_one_we_vetted() {
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            UEFI_NTFS_IMAGE.len(),
+            1024 * 1024,
+            "Rufus builds this as exactly 2048 sectors"
+        );
+        let digest = Sha256::digest(UEFI_NTFS_IMAGE);
+        assert_eq!(
+            blockio::hex(&digest),
+            UEFI_NTFS_SHA256,
+            "the vendored image does not match the hash it was vetted under"
+        );
+        // A FAT filesystem, so firmware can read it at all.
+        assert_eq!(
+            &UEFI_NTFS_IMAGE[510..512],
+            &[0x55, 0xaa],
+            "a boot sector signature must be present"
+        );
     }
 
     #[test]

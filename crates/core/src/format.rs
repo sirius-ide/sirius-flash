@@ -1156,3 +1156,172 @@ mod label_unit_tests {
         assert_eq!(got.chars().count(), 8);
     }
 }
+
+/// How Windows installation media is laid out.
+///
+/// The two differ only in how they cope with `install.wim` exceeding FAT32's
+/// 4 GiB file limit, and that difference decides which firmware will boot the
+/// result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsLayout {
+    /// One FAT32 partition, with the install image split into `.swm` chunks if
+    /// it is too large for the filesystem.
+    ///
+    /// Asks the firmware to verify exactly one image: Microsoft's own
+    /// bootloader, off the ISO. Every Certified-for-Windows machine trusts that
+    /// by definition, so this boots wherever the ISO itself would. The cost is
+    /// time — splitting re-compresses the image — and that Windows Setup sees
+    /// a split image rather than the original.
+    Fat32Split,
+    /// An NTFS partition holding the image untouched, plus a small FAT
+    /// partition carrying the UEFI:NTFS bootloader and an NTFS driver.
+    ///
+    /// Faster, and `install.wim` arrives byte-identical. But the firmware must
+    /// now also trust the **third-party** `Microsoft Corporation UEFI CA 2011`,
+    /// which is optional: OEM guidance says "should consider", the mandatory
+    /// `db` for Windows 11 25H2+ omits it, and Secured-core PCs must distrust
+    /// it. Where it is missing the firmware rejects the bootloader before it
+    /// can print anything, and the user sees only "No bootable option or device
+    /// was found" — indistinguishable from a badly written stick.
+    NtfsUefiNtfs,
+}
+
+impl WindowsLayout {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WindowsLayout::Fat32Split => "fat32-split",
+            WindowsLayout::NtfsUefiNtfs => "ntfs-uefi-ntfs",
+        }
+    }
+
+    /// Which layout to use when the user has not chosen.
+    ///
+    /// Matches Rufus's trigger, which is the size of the largest file rather
+    /// than anything about the image: below FAT32's limit it uses FAT32 and
+    /// nothing exotic is needed; above it, NTFS. Rufus reaches the same answer
+    /// by removing FAT32 from its dropdown entirely once an image has a file
+    /// over 4 GiB (`SetAllowedFileSystems`, `rufus.c:190-207`), which leaves
+    /// NTFS as the only option and pulls in UEFI:NTFS via `format.c:1482`.
+    ///
+    /// We follow it because it is the right default for almost everyone — but
+    /// unlike Rufus we say what it costs, because Rufus says nothing at all.
+    /// Its one warning about the third-party CA, `MSG_129`, is dead code:
+    /// retired in 3.17 when the bootloader became signed, and never replaced.
+    pub fn default_for(largest_file: u64) -> WindowsLayout {
+        match FileSystem::Fat32.max_file_size() {
+            Some(cap) if largest_file > cap => WindowsLayout::NtfsUefiNtfs,
+            _ => WindowsLayout::Fat32Split,
+        }
+    }
+
+    /// What the user should be told before this layout is written, if anything.
+    ///
+    /// Deliberately in the register Rufus's own documentation still uses
+    /// (`res/uefi/readme.txt`: "you may however have to enable 3rd party
+    /// certificates in your Secure Boot settings, as you would to boot Linux")
+    /// rather than the alarmist retired `MSG_129` — the blunt version was
+    /// removed upstream because it had become untrue.
+    pub fn caveat(self) -> Option<&'static str> {
+        match self {
+            WindowsLayout::Fat32Split => None,
+            WindowsLayout::NtfsUefiNtfs => Some(
+                "This layout boots NTFS through the UEFI:NTFS loader, which is Secure Boot \
+                 signed but by Microsoft's *third-party* CA. On most machines it just works. \
+                 On some — Secured-core PCs, many corporate and Surface models — that \
+                 certificate is not trusted, and the machine will report only \"No bootable \
+                 option or device was found\", with no error from the media itself. You may \
+                 have to enable third-party certificates in your firmware's Secure Boot \
+                 settings, as you would to boot Linux. If you cannot change firmware \
+                 settings on the target machine, use the fat32-split layout instead.",
+            ),
+        }
+    }
+
+    /// Does this layout need the vendored UEFI:NTFS image written to a second
+    /// partition?
+    pub fn needs_uefi_ntfs_partition(self) -> bool {
+        matches!(self, WindowsLayout::NtfsUefiNtfs)
+    }
+
+    /// Does this layout need `wimlib-imagex` for an oversized install image?
+    pub fn needs_splitter(self, largest_file: u64) -> bool {
+        self == WindowsLayout::Fat32Split
+            && FileSystem::Fat32
+                .max_file_size()
+                .is_some_and(|cap| largest_file > cap)
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// The trigger is Rufus's: the size of the largest file, not anything about
+    /// the image. Below FAT32's limit nothing exotic is needed.
+    #[test]
+    fn the_default_layout_follows_rufus() {
+        let cap = FileSystem::Fat32.max_file_size().unwrap();
+        assert_eq!(
+            WindowsLayout::default_for(cap),
+            WindowsLayout::Fat32Split,
+            "a file exactly at the limit still fits"
+        );
+        assert_eq!(
+            WindowsLayout::default_for(cap + 1),
+            WindowsLayout::NtfsUefiNtfs,
+            "one byte over and FAT32 cannot hold it"
+        );
+        // The ordinary Windows 11 case: install.wim around 5 GiB.
+        assert_eq!(
+            WindowsLayout::default_for(5 * GB),
+            WindowsLayout::NtfsUefiNtfs
+        );
+        // An older image with a small install.esd.
+        assert_eq!(
+            WindowsLayout::default_for(3 * GB),
+            WindowsLayout::Fat32Split
+        );
+    }
+
+    /// The whole point of diverging from Rufus: it writes this layout and says
+    /// nothing. We match the default and add the sentence it is missing.
+    #[test]
+    fn the_layout_with_a_trust_dependency_carries_a_caveat() {
+        let caveat = WindowsLayout::NtfsUefiNtfs
+            .caveat()
+            .expect("the third-party CA requirement must be stated");
+        assert!(caveat.contains("third-party"), "name the actual dependency");
+        assert!(
+            caveat.contains("No bootable option or device was found"),
+            "quote what the user would actually see, since the media cannot report it"
+        );
+        assert!(
+            caveat.contains("fat32-split"),
+            "name the way out, not just the problem"
+        );
+        assert!(
+            !caveat.contains("MUST DISABLE"),
+            "not the retired alarmist register; the bootloader IS signed"
+        );
+        assert_eq!(
+            WindowsLayout::Fat32Split.caveat(),
+            None,
+            "this one asks the firmware to trust only the ISO's own bootloader"
+        );
+    }
+
+    #[test]
+    fn each_layout_declares_what_it_needs() {
+        let big = 5 * GB;
+        let small = 3 * GB;
+        assert!(WindowsLayout::NtfsUefiNtfs.needs_uefi_ntfs_partition());
+        assert!(!WindowsLayout::Fat32Split.needs_uefi_ntfs_partition());
+        // The splitter is only needed when something actually needs splitting.
+        assert!(WindowsLayout::Fat32Split.needs_splitter(big));
+        assert!(!WindowsLayout::Fat32Split.needs_splitter(small));
+        assert!(
+            !WindowsLayout::NtfsUefiNtfs.needs_splitter(big),
+            "NTFS holds it whole; that is the point"
+        );
+    }
+}

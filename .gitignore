@@ -30,6 +30,11 @@ secrets.*
 *.esd
 *.swm
 
+# …except the vendored UEFI:NTFS image and the test fixtures — both are small,
+# both are required to build, and both are named after the very extensions the
+# rules above match.
+!crates/core/assets/**
+
 # …except test fixtures: small, and the tests will not compile without them.
 # The rules above are extension-wide, so a fixture lands in .gitignore's lap the
 # moment it is named after the format it tests. `git add -A` skips ignored files

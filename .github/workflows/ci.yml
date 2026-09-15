@@ -17,15 +17,17 @@ jobs:
       # errors that say nothing about git. .gitignore carries extension-wide
       # rules (*.img, *.vhd) and `git add -A` skips ignored files in silence, so
       # this is a class of mistake, not a one-off.
-      - name: Every test fixture is committed
+      - name: Every fixture and vendored asset is committed
         shell: bash
         run: |
           # Every file on disk under fixtures/ that git is not tracking, whether
           # it is ignored or merely untracked. Staged files are already in the
           # index, so this does not fire on work in progress.
           stray=$(
-            git ls-files --others --exclude-standard -- crates/core/fixtures/
-            git ls-files --others --ignored --exclude-standard -- crates/core/fixtures/
+            for d in crates/core/fixtures/ crates/core/assets/; do
+              git ls-files --others --exclude-standard -- "$d"
+              git ls-files --others --ignored --exclude-standard -- "$d"
+            done
           )
           if [ -n "$stray" ]; then
             echo "::error::files under crates/core/fixtures/ are untracked or ignored:"
