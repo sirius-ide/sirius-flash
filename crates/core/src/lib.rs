@@ -20,6 +20,8 @@ use anyhow::Context;
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
+use std::io::Write;
+#[cfg(target_os = "linux")]
 use std::process::Command;
 
 #[derive(Debug, Clone)]
@@ -656,6 +658,116 @@ pub const UEFI_NTFS_IMAGE: &[u8] = include_bytes!("../assets/uefi-ntfs.img");
 pub const UEFI_NTFS_SHA256: &str =
     "72683fa1250eeea772d3399277b434d4e55ba8dd0dc926e52d817e701fc2eb9e";
 
+/// Lay out the partitions for a layout, and return the device paths.
+///
+/// `sfdisk` rather than `parted` for the two-partition case, because it is the
+/// only one of the two that can set what this layout actually needs: an exact
+/// type GUID, a partition name, and GPT attribute bit 63.
+///
+/// The type GUID is Microsoft **basic data**, not ESP, and that is deliberate.
+/// Rufus's comment on the same decision (`src/drive.c:2477-2486`) explains why:
+/// a GPT drive declaring two ESPs makes the Windows installer fail at "Copying
+/// Windows Files". Bit 63 is "no drive letter", which keeps the 1 MiB helper
+/// partition from appearing as a drive in Windows.
+///
+/// The helper partition goes last, as Rufus places it. The loader finds its
+/// target by reading each volume's filesystem magic rather than by partition
+/// number, so the order is about keeping Windows Setup happy, not about boot.
+#[cfg(target_os = "linux")]
+fn partition_for_layout(
+    dev: &str,
+    device_size: u64,
+    sector_size: u64,
+    layout: format::WindowsLayout,
+) -> Result<()> {
+    const MIB: u64 = 1024 * 1024;
+    let total = device_size / sector_size;
+    // GPT keeps its backup header and entry array in the last 33 sectors.
+    let last_usable = total.saturating_sub(34);
+    let first = MIB / sector_size;
+    const BASIC_DATA: &str = "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7";
+
+    let script = if layout.needs_uefi_ntfs_partition() {
+        let helper = UEFI_NTFS_IMAGE.len() as u64 / sector_size;
+        if last_usable <= first + helper {
+            bail!("this drive is too small to hold both a data partition and the loader");
+        }
+        // Align the helper partition down to a mebibyte so the data partition
+        // ends on a boundary too.
+        let helper_start = (last_usable - helper + 1) / (MIB / sector_size) * (MIB / sector_size);
+        format!(
+            "label: gpt\n\
+             start={first}, size={}, type={BASIC_DATA}, name=\"Main Data Partition\"\n\
+             start={helper_start}, size={helper}, type={BASIC_DATA}, name=\"UEFI:NTFS\", attrs=\"63\"\n",
+            helper_start - first
+        )
+    } else {
+        format!(
+            "label: gpt\n\
+             start={first}, size={}, type={BASIC_DATA}, name=\"Main Data Partition\"\n",
+            last_usable - first + 1
+        )
+    };
+
+    let mut child = Command::new("sfdisk")
+        .arg("--quiet")
+        .arg(dev)
+        .env("LC_ALL", "C.UTF-8")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| "failed to spawn `sfdisk`")?;
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin was piped")
+        .write_all(script.as_bytes())
+        .context("writing the partition script to sfdisk")?;
+    let status = child.wait().context("waiting for sfdisk")?;
+    if !status.success() {
+        bail!("`sfdisk` exited with {status} while partitioning {dev}");
+    }
+    Ok(())
+}
+
+/// Exposed so the layout can be exercised against a plain file, which is how
+/// it is tested without a real drive.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn partition_for_layout_for_test(
+    dev: &str,
+    device_size: u64,
+    sector_size: u64,
+    layout: format::WindowsLayout,
+) -> Result<()> {
+    partition_for_layout(dev, device_size, sector_size, layout)
+}
+
+/// Write the vendored UEFI:NTFS image onto its partition.
+///
+/// Checked against its pinned hash first. This blob is the one thing we ship
+/// that we cannot rebuild, and it goes to the drive verbatim, so it is verified
+/// every time rather than trusted because it was right at build time.
+#[cfg(target_os = "linux")]
+fn write_uefi_ntfs(part: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let digest = blockio::hex(&Sha256::digest(UEFI_NTFS_IMAGE));
+    if digest != UEFI_NTFS_SHA256 {
+        bail!(
+            "the built-in UEFI:NTFS image hashes to {digest}, not {UEFI_NTFS_SHA256} — \
+             refusing to write a loader we cannot vouch for"
+        );
+    }
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .open(part)
+        .with_context(|| format!("opening {part} to write the UEFI:NTFS loader"))?;
+    out.write_all(UEFI_NTFS_IMAGE)
+        .with_context(|| format!("writing the UEFI:NTFS loader to {part}"))?;
+    out.flush().context("flushing the loader partition")?;
+    out.sync_all().context("syncing the loader partition")?;
+    Ok(())
+}
+
 /// Is this external tool on PATH?
 ///
 /// Searched by hand rather than by running it: plenty of these have no
@@ -738,6 +850,7 @@ pub fn flash_windows_iso(
     iso: &Path,
     tweaks: Option<&WindowsTweaks>,
     format: Option<&format::FormatPlan>,
+    layout: Option<format::WindowsLayout>,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<()> {
     assert_safe_target(d)?;
@@ -805,6 +918,15 @@ pub fn flash_windows_iso(
         }
     };
 
+    // Which layout? Rufus's trigger is the size of the largest file, and we
+    // follow it — but unlike Rufus we say what the choice costs, here, while
+    // the drive is still intact and the user can still change their mind.
+    let layout = layout.unwrap_or_else(|| format::WindowsLayout::default_for(img_size));
+    println!("layout: {}", layout.as_str());
+    if let Some(caveat) = layout.caveat() {
+        println!("note: {caveat}");
+    }
+
     // Which bootloader does this ISO actually carry? An ARM64 Windows ISO has
     // `bootaa64.efi`, not `bootx64.efi`. Finding that out after the copy — which
     // is where the check used to be — means the drive is already wiped and the
@@ -850,10 +972,15 @@ pub fn flash_windows_iso(
     // Everything the destructive phase will shell out to, checked while the
     // drive is still intact. The splitter is only required when the install
     // image actually exceeds what FAT32 can hold.
-    let mut needed = vec!["parted", "udevadm", "mkfs.fat", "mount", "umount", "sync"];
-    const FAT32_MAX_FILE_PREFLIGHT: u64 = 4 * 1024 * 1024 * 1024 - 1;
-    if img_size > FAT32_MAX_FILE_PREFLIGHT {
-        needed.push("wimlib-imagex");
+    let mut needed = vec!["sfdisk", "udevadm", "mount", "umount", "sync"];
+    match layout {
+        format::WindowsLayout::Fat32Split => {
+            needed.push("mkfs.fat");
+            if layout.needs_splitter(img_size) {
+                needed.push("wimlib-imagex");
+            }
+        }
+        format::WindowsLayout::NtfsUefiNtfs => needed.push("mkfs.ntfs"),
     }
     if let Err(e) = require_tools(&needed) {
         let _ = Command::new("umount").arg(iso_mnt).status();
@@ -868,35 +995,52 @@ pub fn flash_windows_iso(
         ))
         .status();
 
+    let part2 = format!("{dev}-part2");
     let result = (|| -> Result<()> {
-        run(
-            "parted",
-            &[
-                "--script", &dev, "mklabel", "gpt", "mkpart", "WIN11", "fat32", "1MiB", "100%",
-                "set", "1", "msftdata", "on",
-            ],
-        )?;
+        partition_for_layout(&dev, d.size_bytes, u64::from(d.sector_size), layout)?;
         run("udevadm", &["settle"])?;
-        // `-s` is sectors per cluster, not bytes.
-        let spc = (plan.cluster_size() / plan.volume().sector_size).to_string();
-        let mut mkfs = vec!["-F", "32", "-s", &spc, "-n", plan.label()];
-        if !plan.quick() {
-            // `-c` reads every sector and marks the unreadable ones bad. It is
-            // read-only — it writes no pattern and reads none back — so it
-            // finds a failing stick but NOT a fake-capacity counterfeit, whose
-            // unwritten sectors read back fine and whose writes wrap silently.
-            // Catching those needs a write-and-verify pass, which read-back
-            // verification after the image is written already does.
-            mkfs.push("-c");
+
+        match layout {
+            format::WindowsLayout::Fat32Split => {
+                // `-s` is sectors per cluster, not bytes.
+                let spc = (plan.cluster_size() / plan.volume().sector_size).to_string();
+                let mut mkfs = vec!["-F", "32", "-s", &spc, "-n", plan.label()];
+                if !plan.quick() {
+                    // `-c` reads every sector and marks the unreadable ones bad.
+                    // It is read-only — it writes no pattern and reads none back
+                    // — so it finds a failing stick but NOT a fake-capacity
+                    // counterfeit, whose unwritten sectors read back fine and
+                    // whose writes wrap silently. Catching those needs a
+                    // write-and-verify pass, which read-back verification after
+                    // the image is written already does.
+                    mkfs.push("-c");
+                }
+                mkfs.push(&part1);
+                run("mkfs.fat", &mkfs)?;
+            }
+            format::WindowsLayout::NtfsUefiNtfs => {
+                // -Q is a quick format; -F skips the "this looks mounted"
+                // heuristics, which misfire on a device we have just
+                // repartitioned.
+                let mut mkfs = vec!["-Q", "-F", "-L", plan.label()];
+                if !plan.quick() {
+                    // ntfs-3g spells the surface scan differently to dosfstools.
+                    mkfs.retain(|a| *a != "-Q");
+                }
+                mkfs.push(&part1);
+                run("mkfs.ntfs", &mkfs)?;
+                // The loader partition is written raw: it is already a FAT12
+                // filesystem, so there is nothing to format.
+                write_uefi_ntfs(&part2)?;
+            }
         }
-        mkfs.push(&part1);
-        run("mkfs.fat", &mkfs)?;
         run("mount", &[&part1, usb_mnt])?;
 
         // FAT32 cannot store a file of 4 GiB or more, so an oversized install
-        // image is split into .swm chunks; a smaller one is copied as-is.
+        // image is split into .swm chunks. NTFS has no such limit, which is the
+        // whole reason that layout exists.
         const FAT32_MAX_FILE: u64 = 4 * 1024 * 1024 * 1024 - 1;
-        let split = img_size > FAT32_MAX_FILE;
+        let split = layout == format::WindowsLayout::Fat32Split && img_size > FAT32_MAX_FILE;
         // When the image is too big for FAT32 it is left out of the copy and
         // split into .swm chunks afterwards instead.
         let exclude: Vec<String> = if split {
@@ -909,6 +1053,8 @@ pub fn flash_windows_iso(
             img_size / 1024 / 1024,
             if split {
                 "will be split for FAT32"
+            } else if layout == format::WindowsLayout::NtfsUefiNtfs {
+                "copied whole onto NTFS"
             } else {
                 "fits FAT32, copied whole"
             }
@@ -1022,6 +1168,7 @@ pub fn flash_windows_iso(
     _iso: &Path,
     _tweaks: Option<&WindowsTweaks>,
     _format: Option<&format::FormatPlan>,
+    _layout: Option<format::WindowsLayout>,
     _on_progress: &mut dyn FnMut(Progress),
 ) -> Result<()> {
     bail!("Windows-ISO flashing not yet implemented on this OS")
@@ -1363,6 +1510,36 @@ mod tests {
             &[0x55, 0xaa],
             "a boot sector signature must be present"
         );
+    }
+
+    /// The layout the flasher picks when the caller does not choose, and the
+    /// tools each needs. Getting the preflight list wrong is how a missing
+    /// package becomes a wiped drive.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_layout_decides_which_tools_must_exist() {
+        use format::WindowsLayout;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // A modern Windows 11 install.wim.
+        assert_eq!(
+            WindowsLayout::default_for(5 * GIB),
+            WindowsLayout::NtfsUefiNtfs
+        );
+        // An older image with a small install.esd.
+        assert_eq!(
+            WindowsLayout::default_for(3 * GIB),
+            WindowsLayout::Fat32Split
+        );
+        // Only the splitting layout needs the splitter, and only when there is
+        // something to split.
+        assert!(WindowsLayout::Fat32Split.needs_splitter(5 * GIB));
+        assert!(!WindowsLayout::Fat32Split.needs_splitter(3 * GIB));
+        assert!(!WindowsLayout::NtfsUefiNtfs.needs_splitter(5 * GIB));
+        // Everything the preflight names must be a real tool on this machine,
+        // or the check would fire spuriously on a working system.
+        for t in ["sfdisk", "udevadm", "mount", "umount", "sync", "mkfs.fat"] {
+            assert!(tool_exists(t), "{t} is expected on a Linux build host");
+        }
     }
 
     #[test]

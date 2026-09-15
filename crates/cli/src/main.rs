@@ -79,6 +79,29 @@ struct FormatArgs {
     /// Finds a dying stick; does NOT detect a fake-capacity counterfeit.
     #[arg(long, help_heading = "Format options")]
     full_format: bool,
+    /// How to lay out Windows media. Default: ntfs-uefi-ntfs when the install
+    /// image is too big for FAT32, fat32-split otherwise — the same rule Rufus
+    /// uses. fat32-split boots on any firmware; ntfs-uefi-ntfs is faster but
+    /// needs the third-party UEFI CA trusted by the target machine.
+    #[arg(long, value_enum, help_heading = "Format options")]
+    layout: Option<LayoutArg>,
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+enum LayoutArg {
+    /// One FAT32 partition; splits an oversized install image into .swm chunks.
+    Fat32Split,
+    /// NTFS plus the UEFI:NTFS loader partition; keeps the image whole.
+    NtfsUefiNtfs,
+}
+
+impl FormatArgs {
+    fn layout(&self) -> Option<core::format::WindowsLayout> {
+        self.layout.map(|l| match l {
+            LayoutArg::Fat32Split => core::format::WindowsLayout::Fat32Split,
+            LayoutArg::NtfsUefiNtfs => core::format::WindowsLayout::NtfsUefiNtfs,
+        })
+    }
 }
 
 /// A sector size has to be a power of two of at least 512, and zero would
@@ -430,6 +453,7 @@ fn main() -> Result<()> {
                         &iso,
                         Some(&tw),
                         plan.as_ref(),
+                        format.layout(),
                         &mut print_progress,
                     )?;
                     println!();
@@ -476,6 +500,7 @@ mod tests {
             label: None,
             cluster_size: None,
             full_format: false,
+            layout: None,
         };
         assert!(args
             .to_plan(32 * 1024 * 1024 * 1024, 512)
@@ -489,6 +514,7 @@ mod tests {
             label: Some("my install".into()),
             cluster_size: Some("32K".into()),
             full_format: true,
+            layout: None,
         };
         let plan = args
             .to_plan(32 * 1024 * 1024 * 1024, 512)
@@ -507,6 +533,7 @@ mod tests {
             label: None,
             cluster_size: Some("512".into()),
             full_format: false,
+            layout: None,
         };
         let err = args.to_plan(32 * 1024 * 1024 * 1024, 512).unwrap_err();
         assert!(err.to_string().contains("16 KB"), "got: {err}");
