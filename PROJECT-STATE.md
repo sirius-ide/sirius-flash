@@ -80,9 +80,9 @@ Cargo workspace **excludes** `app/` (the Tauri app has its own lockfile; CI audi
 - [x] Security: `cargo audit` on both lockfiles, Dependabot, secret scanning, push protection
 
 **108 tests** (24 in `lib.rs`, 42 in `blockio.rs`, 12 in `lzw.rs`, 25 in `format.rs`,
-5 in the CLI); 92 are
-platform-independent — that count is the working proxy for how much of the core is ready
-for the macOS backend.
+5 in the CLI); **98 of them pass on a non-Linux target** — that count is the working proxy
+for how much of the core is ready for the macOS backend, and it is measured, not estimated:
+copy the tree, `sed` the `target_os` guards, and run the suite (see §9).
 
 Binary test fixtures live in `crates/core/fixtures/` with a README saying how each was
 produced. Everything there is a **real** archive, cross-checked against an independent
