@@ -282,7 +282,46 @@ it the warning is worthless.
 `uefi-ntfs.img` is vendored in `crates/core/assets/` because it cannot be built: its value
 is a Microsoft signature. Pinned by SHA-256 and checked in the preflight *and* at the write.
 
-### Boot sectors — next phase, and we write our own
+### Boot sectors — IN PROGRESS. Start here.
+
+`crates/core/boot/mbr.asm` is **written and assembles to 440 bytes (316 used, 124 spare).
+It has never been booted.** Nothing references it, and `buildable()` still refuses every
+BIOS target, so it cannot reach a user — but do not mistake "it assembles" for "it works".
+
+**The next action, in order:**
+
+1. **Exercise `boottest.py vbr` — it has never been run.** `build`, `mbr`, `put` and `run`
+   are covered by the selftest; `vbr` is the one subcommand written without a test. It
+   splices bytes 0x0B-0x59 of the existing BPB into the new record; verify that against a
+   real volume before trusting anything it installs.
+2. **Write `scripts/boot/marker_vbr.asm`** — 512 bytes, `jmp short` at 0x00, zeros through
+   0x59 for the BPB the installer splices in, code from 0x5A. It should not just print a
+   marker: it should check the handover contract and print a *different* marker if it is
+   wrong. That turns "it booted" into "it handed over correctly", which is the part worth
+   testing. The contract `mbr.asm` promises is `DS:SI` → the 16-byte partition entry it
+   booted (so `[si]` is 0x80) and `DL` → the drive.
+3. **Add the cases to `selftest`**, each of which must be seen to fail before it is
+   believed: chainload reaches the VBR; no active partition prints `no active partition`
+   rather than halting silently; two active entries print `bad partition table`; a
+   partition whose first sector lacks 0x55AA prints `not a boot sector`.
+4. **Commit `mbr.bin` beside the source, with a CI step that reassembles and diffs.**
+   Core will `include_bytes!` it, and making the build run `nasm` would put an assembler on
+   the critical path for the macOS and Windows jobs. The diff is what stops the committed
+   binary drifting from the source it claims to be.
+5. **Then the FAT32 volume boot record** (~400 bytes): read the BPB, walk the FAT to find
+   `BOOTMGR` in the root directory, load it, jump. This is the harder half — the MBR reads
+   one sector at a fixed offset, the VBR has to traverse a filesystem.
+6. **Then wire both into the flasher and open the gate.** `format.rs:323` `buildable()` is
+   the single place that refuses BIOS, and its message names the reason — it must stop
+   being true before it stops being returned.
+
+Untested assumptions in `mbr.asm` worth attacking first: that `DL` from the BIOS is
+trustworthy (some firmware does not set it, and the usual workaround is to force 0x80 when
+it looks wrong); that falling back to CHS after a failed LBA read is worth the two bytes;
+and that refusing two active partitions is right rather than merely strict — Windows' own
+MBR does refuse, but check what the media we produce actually writes.
+
+### Why we write our own rather than lifting them
 
 `ms-sys` is GPL-2.0-or-later, so its *logic* is usable. Its blobs are not the same question:
 `br_fat32pe_0x52.h` is Microsoft's boot record (it contains "BOOTMGR is missing"), and the
