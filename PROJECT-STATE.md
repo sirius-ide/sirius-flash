@@ -79,7 +79,7 @@ Cargo workspace **excludes** `app/` (the Tauri app has its own lockfile; CI audi
 - [x] CI green on Ubuntu / macOS / Windows: fmt, `clippy -D warnings`, tests, release build
 - [x] Security: `cargo audit` on both lockfiles, Dependabot, secret scanning, push protection
 
-**101 tests** (22 in `lib.rs`, 42 in `blockio.rs`, 12 in `lzw.rs`, 20 in `format.rs`,
+**108 tests** (24 in `lib.rs`, 42 in `blockio.rs`, 12 in `lzw.rs`, 25 in `format.rs`,
 5 in the CLI); 92 are
 platform-independent — that count is the working proxy for how much of the core is ready
 for the macOS backend.
@@ -241,13 +241,40 @@ fake-capacity stick's unwritten sectors read back fine and its writes wrap silen
 catching one needs write-and-read-back. The read-back verification after an image is
 written is what actually does that, and it already runs by default.
 
-**Next, and needing a decision:**
+**Both open decisions are settled, and implemented.**
 
-- **BIOS boot sectors.** The larger half of Rufus's panel does nothing until we write an
-  MBR bootstrap and partition boot records. Its own phase, not a tack-on.
-- **MBR + UEFI + FAT32** is a real, common layout we currently refuse only because it is
-  not boot-verified. See the note on verification below.
-- **UEFI:NTFS**, per the §6 note above: opt-in expert option or not at all.
+### UEFI:NTFS — we match Rufus's default, and say what it costs
+
+`WindowsLayout::{Fat32Split, NtfsUefiNtfs}`, defaulting on Rufus's own trigger: the size of
+the largest file. Reading the source settled what Rufus actually does, and it was the
+opposite of what this document previously assumed — for an image with a file over 4 GiB,
+`SetAllowedFileSystems` (`rufus.c:190-207`) removes FAT32 from the dropdown *entirely*,
+leaving NTFS, and `format.c:1482` then adds the loader partition off the filesystem alone.
+Rufus does not split by default; FAT32+split lives behind the undocumented Alt-E, and its
+changelog calls splitting "WAY SLOWER than using UEFI:NTFS".
+
+**Where we differ is the warning.** Rufus shows none: `MSG_129`, the one string that ever
+mentioned this, is dead code — retired in 3.17 when the bootloader became signed and never
+replaced. `WindowsLayout::caveat()` names the third-party-CA dependency, quotes what the
+machine will actually say if it is missing ("No bootable option or device was found"), and
+names the way out — and the CLI prints it **before** the confirmation prompt, because after
+it the warning is worthless.
+
+`uefi-ntfs.img` is vendored in `crates/core/assets/` because it cannot be built: its value
+is a Microsoft signature. Pinned by SHA-256 and checked in the preflight *and* at the write.
+
+### Boot sectors — next phase, and we write our own
+
+`ms-sys` is GPL-2.0-or-later, so its *logic* is usable. Its blobs are not the same question:
+`br_fat32pe_0x52.h` is Microsoft's boot record (it contains "BOOTMGR is missing"), and the
+GPL header covers Henrik Carlqvist's code, not Microsoft's bytes. `mbr_rufus.h` is pbatard's
+own and is clean.
+
+So: write our own. An MBR that chainloads the active partition is ~100 bytes of assembly, a
+FAT32 boot record that loads `BOOTMGR` ~400; `nasm` is installed, the structures are
+documented, and the harness below tells us in seconds whether it boots. That avoids a legal
+question nobody can answer confidently, and we would have had to understand the blobs
+field-by-field to patch their BPBs anyway.
 
 ### Boot testing: possible here, today, with no root and no mtools
 
@@ -282,7 +309,7 @@ rather than being copied verbatim.
 
 ## 7. Backlog after that
 
-Built-in ISO downloader (Linux catalogue first, then Windows) · macOS backend ·
+**BIOS boot sectors** (see §6) · Built-in ISO downloader (Linux catalogue first, then Windows) · macOS backend ·
 Windows backend · signed CI releases → `dl.siriuside.com` + AUR · persistent-partition
 support · bad-block check.
 
@@ -305,7 +332,7 @@ support · bad-block check.
 
 ```bash
 cargo build --release                       # core + CLI
-cargo test --workspace                      # 101 tests
+cargo test --workspace                      # 108 tests
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 cd app && pnpm install && pnpm tauri dev    # GUI
 ```
