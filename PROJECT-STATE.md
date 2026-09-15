@@ -55,6 +55,10 @@ crates/core/src/format.rs   format options: scheme/target/filesystem/cluster/lab
 crates/core/src/lzw.rs      streaming Unix compress (.Z) decoder
 crates/core/fixtures/       real binary test archives, with a README on provenance
 crates/cli/src/main.rs      `sirius-flash list | write | unattend`
+scripts/boottest.py         boot-test harness: build media in a plain file,
+                            install boot code, boot it under qemu, read the screen
+scripts/boot/marker.asm     a known-good MBR, so the harness can prove it
+                            detects a working boot sector as well as a dead one
 app/src-tauri/src/lib.rs    Tauri commands; spawns the CLI under pkexec
 app/src/main.ts             frontend logic
 app/index.html              UI (cards ①-④)
@@ -311,15 +315,44 @@ Output is read without a display by dumping the VGA text buffer from the qemu mo
 `memsave 0xb8000 4000` — and decoding the 80x25 char/attr pairs. Deterministic and
 greppable; no screenshots.
 
-Verified here: `sfdisk` + `mkfs.fat --offset=2048` on a 64 MiB file produces a bootable-flagged
-type-0x0c entry at LBA 2048 and a valid VBR with the right label, entirely unprivileged.
+**This is built: `scripts/boottest.py`.** `build` makes the media, `mbr` and `vbr` install
+boot code, `put` writes a file into the FAT32 volume, `run` boots it and prints the screen.
+`selftest` runs the whole thing in about five seconds and is a `boot` job in CI.
 
-Demonstrated on the same harness: media with **no** boot code — which is what this build
-produces for an MBR+BIOS target — gives `Booting from Hard Disk...` and then silence. The
-silent dead stick §4 warns about, reproducible in seconds.
+The selftest is a **negative** test before it is a positive one. It asserts that media with
+no boot code is reported as dead — SeaBIOS reaches `Booting from Hard Disk...` and then
+nothing, the silent dead stick §4 warns about — and only then that a known-good sector is
+reported as alive. A rig that has only ever seen a pass is indistinguishable from one that
+always passes, so both directions were confirmed by breaking the marker and watching the
+selftest exit 1.
+
+Five traps, each of which silently produces media that looks fine:
+
+- **`mkfs.fat` does not derive hidden sectors from `--offset`.** Without `-h`, the BPB says
+  the volume starts at LBA 0 and every absolute read a boot sector computes lands 2048
+  sectors early. `build` sets it and `Bpb.check` refuses media where it disagrees.
+- **`BLOCK-COUNT` is in 1024-byte blocks, not sectors.** Passing the sector count builds a
+  filesystem twice the size of its partition, which mounts happily until something reads
+  past the end.
+- **`mkfs.fat -F 32` will build a volume below FAT32's 65525-cluster floor** without saying
+  so; only `fsck.fat` mentions it afterwards. Hence a 512 MiB default and an explicit check.
+- **qemu's `memsave` rejects an absolute path**, because the HMP parser reads a leading `/`
+  as a format specifier: it fails with `invalid char 't' in expression`, writes nothing, and
+  leaves qemu's exit status untouched. The harness runs qemu with its cwd set and passes a
+  bare filename.
+- **Reading a volume back with the code that wrote it proves nothing.** A directory entry
+  one byte too long reported a 30000-byte file as 7680000; the harness's own parser agreed
+  with itself, and `fsck.fat` and `7z` are what caught it. Case 3 of the selftest keeps
+  `fsck.fat` in the loop.
+
+Two deliberate choices about geometry: the default is 8 sectors per cluster rather than the
+1 `mkfs.fat` picks, because a 1-sector cluster is the one case where cluster-to-LBA
+arithmetic is the identity and a boot sector that multiplies by the wrong thing still
+passes; and `mbr` installs 440 bytes, not 446 or 512, so the disk identifier and the
+partition table survive.
 
 So testability is **not** a reason to defer boot-sector work. The reasons that remain are
-the provenance question below and the fact that the blobs need per-volume BPB patching
+the provenance question above and the fact that the blobs need per-volume BPB patching
 rather than being copied verbatim.
 
 ## 7. Backlog after that

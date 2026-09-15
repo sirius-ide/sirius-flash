@@ -91,3 +91,27 @@ jobs:
         run: |
           cargo fmt --check
           cargo clippy --all-targets -- -D warnings
+
+  # The boot-test harness, run against itself. The next phase writes an MBR and
+  # a FAT32 boot record, and the only thing that can say whether 500 bytes of
+  # assembly works is a machine trying to boot them — so the harness has to be
+  # trustworthy before any of that is written.
+  #
+  # Its selftest is a negative test as much as a positive one: it asserts that
+  # media with no boot code is reported as dead, and only then that a known-good
+  # sector is reported as alive. A rig that has only ever seen a pass cannot be
+  # told apart from one that always passes.
+  #
+  # Everything runs unprivileged under TCG, so no KVM and no root: this works in
+  # a container as well as it does on a laptop.
+  boot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Harness dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 nasm dosfstools
+      - name: Boot-test harness selftest
+        run: ./scripts/boottest.py selftest
