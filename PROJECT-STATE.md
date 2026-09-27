@@ -3,7 +3,7 @@
 Living handoff document. Anyone (or any new session) picking this up cold should read
 this file first, then `README.md`, then `SECURITY.md`.
 
-**Last updated:** 2026-09-15. For the commit this describes, ask git —
+**Last updated:** 2026-09-28. For the commit this describes, ask git —
 `git log -1 --format=%h PROJECT-STATE.md`. A hash written into the file by hand
 names the commit *before* the one containing it, and this one had drifted five
 commits before anyone noticed.
@@ -321,6 +321,42 @@ it looks wrong); that falling back to CHS after a failed LBA read is worth the t
 and that refusing two active partitions is right rather than merely strict — Windows' own
 MBR does refuse, but check what the media we produce actually writes.
 
+### The Rufus source: where it is and how to read it
+
+Every `rufus.c:NNN` citation in this file points into a checkout that lives in a session
+scratchpad and **does not survive**. Recreate it with
+
+```bash
+git clone --depth 50 https://github.com/pbatard/rufus
+```
+
+All six cited locations (`rufus.c:190-207`, `:450-612`, `:2642`; `format.c:284-288`, `:1482`;
+`bled/bled.h:25-35`) were re-verified against upstream `942ed3a` (2026-09-21). If they drift,
+`git log -S` on the quoted identifier finds them again.
+
+**The boot-sector blobs in `src/ms-sys/inc/` are C arrays of hex bytes.** A text grep for
+`"BOOTMGR is missing"` returns nothing and proves nothing — decode `0x..` tokens to bytes
+first, then search. Done that way, the provenance record below holds exactly: the string is
+in `br_fat32pe_0x52.h`, which carries **no header comment at all**, while `mbr_rufus.h`
+opens with `Copyright © 2012-2014 Pete Batard`.
+
+Three things the decode showed that matter for the work ahead:
+
+- **Microsoft's FAT32 boot code does not fit in one sector.** It is `_0x52` (924 bytes,
+  i.e. sector 0 plus a continuation), `_0x3f0` and `_0x1800` — spread across the reserved
+  area. A single-sector VBR of ~420 code bytes is a *tighter* target than Microsoft set
+  itself; if it will not fit, the honest design is a two-stage loader with stage 2 in the
+  reserved sectors, which is what they did. Decide this before writing step 5, not during.
+- **Refusing two active partitions is the norm, not strictness.** `mbr_syslinux.h` and
+  `mbr_gpt_syslinux.h` both carry `Multiple active partitions`; `mbr_reactos.h` carries
+  `no active partition found`, `read error while reading drive` and `partition signature
+  != 55AA` — the same three failures ours reports. One of the three flagged assumptions
+  in `mbr.asm` is therefore settled in its favour.
+- **Rufus's own MBR waits for a keypress** (`Press any key to boot from USB.`) and
+  otherwise falls through to the next drive. That is a UX choice for a *dual-purpose*
+  stick, not a correctness requirement, and it is not ours to copy — but know it exists
+  when comparing behaviour on real hardware.
+
 ### Why we write our own rather than lifting them
 
 `ms-sys` is GPL-2.0-or-later, so its *logic* is usable. Its blobs are not the same question:
@@ -402,7 +438,9 @@ support · bad-block check.
 
 ## 8. Open items
 
-- Dependabot is clear and **no PRs are open**. `actions/checkout@7`, `typescript 7.0.2`
+- **Dependabot PR #5 is open** (`clap 4.6.6 → 4.6.7`, 2026-09-21), unreviewed: the session
+  that would have handled it was asked to stop. A patch bump on a CLI parser; expect it to
+  merge unchanged, but look. Otherwise Dependabot is clear. `actions/checkout@7`, `typescript 7.0.2`
   and `sha2 0.11.0` merged unchanged. `ruzstd 0.9.0` needed a code change, so it was made
   here and PR #1 closed — and it did **not** close itself when the push landed: a different
   commit making the same change is invisible to GitHub, so that had to be done by hand.
