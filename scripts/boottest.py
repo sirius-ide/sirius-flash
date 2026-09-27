@@ -63,11 +63,13 @@ class Bpb:
         self.sec_per_clus = u(0x0D, 1)
         self.rsvd_sec = u(0x0E, 2)
         self.num_fats = u(0x10, 1)
+        self.fat_sz16 = u(0x16, 2)
         self.hidden = u(0x1C, 4)
         self.tot_sec32 = u(0x20, 4)
         self.fat_sz32 = u(0x24, 4)
         self.root_clus = u(0x2C, 4)
         self.fs_info = u(0x30, 2)
+        self.bk_boot_sec = u(0x32, 2)
         if vbr[510:512] != b"\x55\xaa":
             sys.exit("volume has no 0x55AA signature — is the offset right?")
         if self.bytes_per_sec != SECTOR:
@@ -101,6 +103,10 @@ class Bpb:
             sys.exit(f"BPB hidden sectors is {self.hidden}, expected {self.part_start}")
         if self.tot_sec32 > part_sectors:
             sys.exit(f"filesystem claims {self.tot_sec32} sectors, partition has {part_sectors}")
+        # On FAT12/16 the BPB ends at 0x3E and 0x24 onwards is boot code, so
+        # every FAT32 field read above would be a misreading of it.
+        if self.fat_sz16 != 0:
+            sys.exit("this is FAT12/16, not FAT32 (BPB_FATSz16 is non-zero)")
         # What separates FAT32 from FAT16 is the cluster count, not the BPB
         # fields, and `mkfs.fat -F 32` will build a volume below the floor
         # without complaining — only `fsck.fat` mentions it afterwards. Media
@@ -115,6 +121,22 @@ def read_bpb(image, part_start):
     with open(image, "rb") as f:
         f.seek(part_start * SECTOR)
         return Bpb(f.read(SECTOR), part_start)
+
+
+def partition_sectors(image, start):
+    """Size of the MBR partition beginning at `start`; exits if none does."""
+    with open(image, "rb") as f:
+        mbr = f.read(SECTOR)
+    if mbr[510:512] != b"\x55\xaa":
+        sys.exit("no partition table at LBA 0")
+    # Each entry: status, CHS first, type, CHS last, LBA start, sector count.
+    entries = [struct.unpack_from("<B3xB3xII", mbr, 446 + 16 * i) for i in range(4)]
+    used = [(lba, count) for _, ptype, lba, count in entries if ptype]
+    for lba, count in used:
+        if lba == start:
+            return count
+    sys.exit(f"no partition starts at LBA {start}; "
+             f"the table has {[lba for lba, _ in used] or 'none'}")
 
 
 # --------------------------------------------------------------------------- #
@@ -172,21 +194,68 @@ def cmd_vbr(a):
     Boot code and filesystem geometry live in the same 512 bytes, which is why
     ms-sys and Rufus patch a BPB into their blobs rather than writing them
     whole. Bytes 0x0B-0x59 describe *this* volume and must survive; the jump at
-    0x00-0x02 and the code from 0x5A on come from the new record.
+    0x00-0x02, the OEM name and the code from 0x5A on come from the new record.
+    (ms-sys keeps only 0x0B-0x51 and writes the "FAT32   " type string itself;
+    it refuses any volume where that string is not already there, so on every
+    volume either would touch the two produce the same bytes.)
+
+    Every check runs before the first write. The first version wrote and then
+    re-parsed, so `--start 0` replaced the partition table and only afterwards
+    reported "unsupported sector size 0".
     """
     new = open(a.binary, "rb").read()
     if len(new) != SECTOR:
         sys.exit(f"{a.binary} is {len(new)} bytes; a VBR must be exactly {SECTOR}")
+    if new[510:512] != b"\x55\xaa":
+        sys.exit(f"{a.binary} does not end in 0x55AA — not built as a boot sector")
+    # The jump is what carries the CPU over the BPB. A binary laid out as plain
+    # code from 0x00 — an MBR, say — has none, and its bytes 0x0B-0x59 are
+    # instructions the splice below would replace with geometry.
+    if new[0] == 0xEB:
+        target = 2 + int.from_bytes(new[1:2], "little", signed=True)
+    elif new[0] == 0xE9:
+        target = 3 + int.from_bytes(new[1:3], "little", signed=True)
+    else:
+        sys.exit(f"{a.binary} does not start with a jump over the BPB")
+    if not 0x5A <= target < 510:
+        sys.exit(f"{a.binary} jumps to 0x{target:X}; code must start at or after 0x5A")
+    # Anything here is overwritten, so anything here was a mistake: the splice
+    # would replace it with this volume's geometry and the install would still
+    # report success. Reserve the region with zeros.
+    if any(new[0x0B:0x5A]):
+        sys.exit(f"{a.binary} has non-zero bytes in 0x0B-0x59, which the installer "
+                 f"overwrites with this volume's BPB; reserve them with zeros")
+
+    # Partition table first: pointed at the wrong LBA, "no partition starts
+    # there" is the answer, not whatever a BPB parse makes of the bytes found.
+    sectors = partition_sectors(a.image, a.start)
+    bpb = read_bpb(a.image, a.start)
+    bpb.check(sectors)
     with open(a.image, "r+b") as f:
         f.seek(a.start * SECTOR)
         old = f.read(SECTOR)
+        targets = [a.start]
+        # The backup boot sector gets the same record. Rufus writes both
+        # (format.c WritePBR, `_offset += 6 * SectorSize`). A stale backup makes
+        # every `fsck.fat` on the stick report differences, and a repair that
+        # restores from it quietly puts back the code this replaced. 0 and
+        # 0xFFFF both mean "no backup".
+        if bpb.bk_boot_sec not in (0, 0xFFFF):
+            if bpb.bk_boot_sec >= bpb.rsvd_sec or bpb.bk_boot_sec == bpb.fs_info:
+                sys.exit(f"BPB puts the backup boot sector at {bpb.bk_boot_sec}, "
+                         f"which is not a free reserved sector")
+            f.seek((a.start + bpb.bk_boot_sec) * SECTOR)
+            if f.read(SECTOR)[0x0B:0x5A] != old[0x0B:0x5A]:
+                sys.exit("the backup boot sector's BPB differs from the primary's; "
+                         "run fsck.fat on the volume first")
+            targets.append(a.start + bpb.bk_boot_sec)
+
         merged = bytearray(new)
         merged[0x0B:0x5A] = old[0x0B:0x5A]
-        merged[510:512] = b"\x55\xaa"
-        f.seek(a.start * SECTOR)
-        f.write(merged)
-    read_bpb(a.image, a.start)  # re-parse: proves the BPB survived
-    print(f"installed VBR at LBA {a.start}, BPB preserved")
+        for lba in targets:
+            f.seek(lba * SECTOR)
+            f.write(merged)
+    print(f"installed VBR at LBA {', '.join(map(str, targets))}, BPB preserved")
 
 
 # --------------------------------------------------------------------------- #
@@ -462,6 +531,86 @@ def cmd_selftest(a):
                               f"({check.returncode})")
             else:
                 print("fsck.fat reads the volume clean")
+
+        # Case 4 checks `vbr`, which every boot-record case after it relies on.
+        # Its failures were all silent the first time it was run. Pointed at the
+        # wrong sector it wrote first and validated after: `--start 0` replaced
+        # the partition table and only then said "unsupported sector size 0".
+        # Given a binary with code in 0x0B-0x59 it overwrote that code with
+        # this volume's geometry and reported success. And it left the backup
+        # boot sector holding the old code. So it has to refuse with the image
+        # untouched before its install is worth checking at all.
+        print("\n--- case 4: the VBR installer ---")
+        # MBR through the partition's reserved area: every sector `vbr` can
+        # reach from the two starts used below.
+        with open(img, "rb") as f:
+            head = f.read((2048 + read_bpb(img, 2048).rsvd_sec) * SECTOR)
+
+        fixture = bytearray(SECTOR)
+        fixture[0:3] = b"\xeb\x58\x90"                  # jmp short 0x5A; nop
+        fixture[3:11] = b"SIRIUSVB"                     # OEM name: ours, not the volume's
+        # Position-dependent bytes, so a write shifted by one cannot match.
+        fixture[0x5A:510] = bytes(i & 0xFF for i in range(0x5A, 510))
+        fixture[510:] = b"\x55\xaa"
+        stray = bytearray(fixture)
+        stray[0x3E] = 0x90                              # one byte of code inside the BPB
+        mbr_as_vbr = open(mbr, "rb").read().ljust(510, b"\0") + b"\x55\xaa"
+        vbr = os.path.join(tmp, "try.vbr")
+
+        for binary, start, what in [
+            (mbr_as_vbr, 2048, "an MBR padded to 512 bytes"),
+            (stray, 2048, "a VBR with code in the BPB region"),
+            (fixture, 0, "--start 0, which is the MBR"),
+        ]:
+            with open(vbr, "wb") as f:
+                f.write(binary)
+            try:
+                cmd_vbr(argparse.Namespace(image=img, binary=vbr, start=start))
+                why = None
+            except SystemExit as e:
+                why = e.code
+            with open(img, "r+b") as f:
+                now = f.read(len(head))
+                if now != head:
+                    f.seek(0)
+                    f.write(head)                       # restore, so later checks start clean
+            if now != head:
+                failed.append(f"case 4: {what} was "
+                              f"{'refused only after writing' if why else 'accepted and written'}")
+            elif why is None:
+                failed.append(f"case 4: accepted {what}")
+            else:
+                print(f"refused {what}, image untouched: {why}")
+
+        with open(vbr, "wb") as f:
+            f.write(fixture)
+        cmd_vbr(argparse.Namespace(image=img, binary=vbr, start=2048))
+        with open(img, "rb") as f:
+            now = f.read(len(head))
+        primary = 2048 * SECTOR
+        old = head[primary : primary + SECTOR]
+        backup = (2048 + int.from_bytes(old[0x32:0x34], "little")) * SECTOR
+        want = bytes(fixture[:0x0B]) + old[0x0B:0x5A] + bytes(fixture[0x5A:])
+        for name, off in (("primary", primary), ("backup", backup)):
+            if now[off : off + SECTOR] != want:
+                failed.append(f"case 4: the {name} boot sector is not jump + OEM from the "
+                              f"binary, 0x0B-0x59 from the volume, code from the binary")
+        unchanged = lambda b: b[:primary] + b[primary + SECTOR : backup] + b[backup + SECTOR :]
+        if unchanged(now) != unchanged(head):
+            failed.append("case 4: vbr wrote outside the two boot sectors")
+
+        if shutil.which("fsck.fat") is None:
+            print("fsck.fat not installed — skipping its half of case 4 (skipped, not passing)")
+        else:
+            sh("dd", f"if={img}", f"of={part}", "bs=512", "skip=2048",
+               "conv=sparse", "status=none")
+            check = subprocess.run(["fsck.fat", "-n", part], capture_output=True, text=True)
+            print(check.stdout.strip())
+            # fsck.fat calls a stale backup boot sector "mostly harmless" and
+            # exits 0, so its exit status alone passes exactly the bug this is
+            # looking for. The text is the only signal.
+            if check.returncode != 0 or "differences between boot sector" in check.stdout:
+                failed.append("case 4: fsck.fat objects to the volume after vbr")
     finally:
         if a.keep:
             print(f"\nkept: {tmp}")

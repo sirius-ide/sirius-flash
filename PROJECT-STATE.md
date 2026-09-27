@@ -288,30 +288,52 @@ is a Microsoft signature. Pinned by SHA-256 and checked in the preflight *and* a
 It has never been booted.** Nothing references it, and `buildable()` still refuses every
 BIOS target, so it cannot reach a user — but do not mistake "it assembles" for "it works".
 
+**`boottest.py vbr` has now been run, and it is case 4 of the selftest.** The splice itself
+was right — every byte of the installed sector was traced to its source, and `fsck.fat`,
+`blkid` and `file` all read the volume as before. Everything around the splice was wrong,
+and every failure was silent:
+
+- **It wrote before it checked.** `--start 0` replaced the partition table and *then* said
+  "unsupported sector size". Every check now runs before the first write, and the
+  partition table is consulted first, so a wrong offset says "no partition starts at LBA
+  N; the table has [2048]" rather than reporting whatever a BPB parse made of the bytes.
+- **It accepted any 512 bytes.** Given an MBR padded to a sector, it wrote this volume's
+  geometry over the instructions at 0x0B-0x59 and reported success; the result does not
+  boot. It now requires a `jmp` at 0x00 landing at or after 0x5A, zeros in 0x0B-0x59, and
+  0x55AA at the end — it no longer *adds* the signature, because a binary without one was
+  not assembled as a boot sector, and adding it hides that.
+- **It left the backup boot sector stale.** FAT32 keeps a copy at `BkBootSec` (sector 6
+  here), which Rufus also writes (`format.c` `WritePBR`, `_offset += 6 * SectorSize`). A
+  stale copy makes every `fsck.fat` on the stick report differences, and a repair that
+  restores from it quietly puts the old code back. Both sectors get the record now.
+
+Case 4 was seen to fail five ways against the old code before the fix went in. One
+detail worth keeping: `fsck.fat` calls the stale backup "mostly harmless" and **exits 0**,
+so an exit-status check passes exactly the bug the case exists to find; the text is the
+only signal. `ms-sys` splices 0x0B-0x51 and writes `"FAT32   "` itself; we keep through
+0x59 — same bytes on any volume either would accept, since it refuses one where the
+string is not already there.
+
 **The next action, in order:**
 
-1. **Exercise `boottest.py vbr` — it has never been run.** `build`, `mbr`, `put` and `run`
-   are covered by the selftest; `vbr` is the one subcommand written without a test. It
-   splices bytes 0x0B-0x59 of the existing BPB into the new record; verify that against a
-   real volume before trusting anything it installs.
-2. **Write `scripts/boot/marker_vbr.asm`** — 512 bytes, `jmp short` at 0x00, zeros through
+1. **Write `scripts/boot/marker_vbr.asm`** — 512 bytes, `jmp short` at 0x00, zeros through
    0x59 for the BPB the installer splices in, code from 0x5A. It should not just print a
    marker: it should check the handover contract and print a *different* marker if it is
    wrong. That turns "it booted" into "it handed over correctly", which is the part worth
    testing. The contract `mbr.asm` promises is `DS:SI` → the 16-byte partition entry it
    booted (so `[si]` is 0x80) and `DL` → the drive.
-3. **Add the cases to `selftest`**, each of which must be seen to fail before it is
+2. **Add the cases to `selftest`**, each of which must be seen to fail before it is
    believed: chainload reaches the VBR; no active partition prints `no active partition`
    rather than halting silently; two active entries print `bad partition table`; a
    partition whose first sector lacks 0x55AA prints `not a boot sector`.
-4. **Commit `mbr.bin` beside the source, with a CI step that reassembles and diffs.**
+3. **Commit `mbr.bin` beside the source, with a CI step that reassembles and diffs.**
    Core will `include_bytes!` it, and making the build run `nasm` would put an assembler on
    the critical path for the macOS and Windows jobs. The diff is what stops the committed
    binary drifting from the source it claims to be.
-5. **Then the FAT32 volume boot record** (~400 bytes): read the BPB, walk the FAT to find
+4. **Then the FAT32 volume boot record** (~400 bytes): read the BPB, walk the FAT to find
    `BOOTMGR` in the root directory, load it, jump. This is the harder half — the MBR reads
    one sector at a fixed offset, the VBR has to traverse a filesystem.
-6. **Then wire both into the flasher and open the gate.** `format.rs:323` `buildable()` is
+5. **Then wire both into the flasher and open the gate.** `format.rs:323` `buildable()` is
    the single place that refuses BIOS, and its message names the reason — it must stop
    being true before it stops being returned.
 
@@ -346,7 +368,7 @@ Three things the decode showed that matter for the work ahead:
   i.e. sector 0 plus a continuation), `_0x3f0` and `_0x1800` — spread across the reserved
   area. A single-sector VBR of ~420 code bytes is a *tighter* target than Microsoft set
   itself; if it will not fit, the honest design is a two-stage loader with stage 2 in the
-  reserved sectors, which is what they did. Decide this before writing step 5, not during.
+  reserved sectors, which is what they did. Decide this before writing step 4, not during.
 - **Refusing two active partitions is the norm, not strictness.** `mbr_syslinux.h` and
   `mbr_gpt_syslinux.h` both carry `Multiple active partitions`; `mbr_reactos.h` carries
   `no active partition found`, `read error while reading drive` and `partition signature
