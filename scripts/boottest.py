@@ -16,7 +16,8 @@ Output is read without a display by dumping the VGA text buffer from the qemu
 monitor (`memsave 0xb8000 4000`) and decoding the 80x25 char/attribute pairs, so
 results are greppable strings rather than screenshots.
 
-    ./scripts/boottest.py selftest          # proves the harness detects both outcomes
+    ./scripts/boottest.py selftest          # proves the harness detects both outcomes,
+                                            # then boots crates/core/boot/mbr.asm
 
 Requires: sfdisk, mkfs.fat, qemu-system-x86_64, nasm (selftest only), python3.
 """
@@ -602,6 +603,7 @@ def cmd_selftest(a):
         if shutil.which("fsck.fat") is None:
             print("fsck.fat not installed — skipping its half of case 4 (skipped, not passing)")
         else:
+            part = os.path.join(tmp, "part.img")
             sh("dd", f"if={img}", f"of={part}", "bs=512", "skip=2048",
                "conv=sparse", "status=none")
             check = subprocess.run(["fsck.fat", "-n", part], capture_output=True, text=True)
@@ -611,6 +613,65 @@ def cmd_selftest(a):
             # looking for. The text is the only signal.
             if check.returncode != 0 or "differences between boot sector" in check.stdout:
                 failed.append("case 4: fsck.fat objects to the volume after vbr")
+
+        # Cases 5-8 boot crates/core/boot/mbr.asm, the MBR this project will
+        # ship. Case 5 is the positive one, and it asks more than "the VBR
+        # ran": marker_vbr.asm checks the handover contract — CS:IP, DS:SI ->
+        # the entry booted, DL -> the drive — and prints a different marker
+        # naming the first check that fails, so a wrong handover cannot pass
+        # for a right one. Each check was seen to catch a variant of the MBR
+        # with that one bug put in. Cases 6-8 are the MBR's refusals, which
+        # have to say something: a stick that halts in silence cannot be told
+        # from a dead one. Every message was seen to be missing under an MBR
+        # that does not print it.
+        print("\n--- case 5: the MBR chainloads, and the handover is checked ---")
+        real_mbr = os.path.join(tmp, "mbr.bin")
+        sh("nasm", "-f", "bin",
+           os.path.join(here, "..", "crates", "core", "boot", "mbr.asm"), "-o", real_mbr)
+        marker_vbr = os.path.join(tmp, "marker_vbr.bin")
+        sh("nasm", "-f", "bin", os.path.join(here, "boot", "marker_vbr.asm"),
+           "-o", marker_vbr)
+        cmd_vbr(argparse.Namespace(image=img, binary=marker_vbr, start=2048))
+        cmd_mbr(argparse.Namespace(image=img, binary=real_mbr))
+        # Either marker ends the wait; only silence costs the timeout.
+        screen = boot_and_read(img, expect="SIRIUS-VBR-", timeout=a.timeout)
+        show(screen)
+        marker = next((l[l.index("SIRIUS-VBR-"):].split()[0]
+                       for l in screen if "SIRIUS-VBR-" in l), None)
+        if marker == "SIRIUS-VBR-OK":
+            print("\nthe VBR marker is on screen, and every part of the handover checked out")
+        elif marker:
+            failed.append(f"case 5: the MBR reached the VBR with the handover wrong: {marker}")
+        else:
+            failed.append("case 5: the MBR never reached the VBR")
+
+        def refusal(case, what, off, data, expect):
+            """Break the media one way, boot it, and require the MBR to say so."""
+            print(f"\n--- case {case}: {what} ---")
+            with open(img, "r+b") as f:
+                f.seek(off)
+                saved = f.read(len(data))
+                f.seek(off)
+                f.write(data)
+            try:
+                # Any message from the MBR ends the wait, so the wrong message
+                # is reported at once rather than after the timeout.
+                screen = boot_and_read(img, expect="Sirius: ", timeout=a.timeout)
+            finally:
+                with open(img, "r+b") as f:
+                    f.seek(off)
+                    f.write(saved)
+            show(screen)
+            if any(expect in l for l in screen):
+                print(f"\nthe MBR said so: {expect!r}")
+            else:
+                failed.append(f"case {case}: {what}, and the MBR did not say {expect!r}")
+
+        table = 446
+        refusal(6, "no active partition", table, b"\x00", "no active partition")
+        refusal(7, "two active partitions", table + 16, b"\x80", "bad partition table")
+        refusal(8, "the active partition is not a boot sector",
+                2048 * SECTOR + 510, b"\x00\x00", "not a boot sector")
     finally:
         if a.keep:
             print(f"\nkept: {tmp}")
@@ -622,7 +683,8 @@ def cmd_selftest(a):
         for f in failed:
             print(f"  - {f}", file=sys.stderr)
         return 1
-    print("\nSELFTEST PASSED: the harness detects a booting MBR and a dead one")
+    print("\nSELFTEST PASSED: the harness detects a booting MBR and a dead one, "
+          "and ours chainloads, refuses, and hands over correctly")
     return 0
 
 

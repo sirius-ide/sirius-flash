@@ -92,15 +92,16 @@ jobs:
           cargo fmt --check
           cargo clippy --all-targets -- -D warnings
 
-  # The boot-test harness, run against itself. The next phase writes an MBR and
-  # a FAT32 boot record, and the only thing that can say whether 500 bytes of
-  # assembly works is a machine trying to boot them — so the harness has to be
-  # trustworthy before any of that is written.
+  # The boot-test harness, run against itself and then against our MBR. The
+  # only thing that can say whether 500 bytes of assembly works is a machine
+  # trying to boot them, so the harness has to be trustworthy first.
   #
-  # Its selftest is a negative test as much as a positive one: it asserts that
-  # media with no boot code is reported as dead, and only then that a known-good
-  # sector is reported as alive. A rig that has only ever seen a pass cannot be
-  # told apart from one that always passes.
+  # Cases 1-4 are a negative test as much as a positive one: media with no boot
+  # code must be reported as dead before a known-good sector is reported as
+  # alive, because a rig that has only ever seen a pass cannot be told apart
+  # from one that always passes. Cases 5-8 then boot crates/core/boot/mbr.asm:
+  # it must chainload with the handover contract intact, and refuse bad media
+  # aloud rather than halt in silence.
   #
   # Everything runs unprivileged under TCG, so no KVM and no root: this works in
   # a container as well as it does on a laptop.

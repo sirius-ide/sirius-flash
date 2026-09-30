@@ -59,6 +59,8 @@ scripts/boottest.py         boot-test harness: build media in a plain file,
                             install boot code, boot it under qemu, read the screen
 scripts/boot/marker.asm     a known-good MBR, so the harness can prove it
                             detects a working boot sector as well as a dead one
+scripts/boot/marker_vbr.asm a VBR that checks the MBR's handover contract and
+                            names the first part of it that is wrong
 app/src-tauri/src/lib.rs    Tauri commands; spawns the CLI under pkexec
 app/src/main.ts             frontend logic
 app/index.html              UI (cards ①-④)
@@ -284,12 +286,41 @@ is a Microsoft signature. Pinned by SHA-256 and checked in the preflight *and* a
 
 ### Boot sectors — IN PROGRESS. Start here.
 
-`crates/core/boot/mbr.asm` is **written and assembles to 440 bytes (316 used, 124 spare).
-It has never been booted.** Nothing references it, and `buildable()` still refuses every
-BIOS target, so it cannot reach a user — but do not mistake "it assembles" for "it works".
+`crates/core/boot/mbr.asm` **boots.** It assembles to 440 bytes (316 used), chainloaded
+under SeaBIOS on the first try, and is cases 5-8 of the selftest, so CI boots it on every
+push. Nothing references it from Rust yet, and `buildable()` still refuses every BIOS
+target, so it cannot reach a user.
 
-**`boottest.py vbr` has now been run, and it is case 4 of the selftest.** The splice itself
-was right — every byte of the installed sector was traced to its source, and `fsck.fat`,
+**What the first boot established**, with `scripts/boot/marker_vbr.asm` on the other end.
+The marker does not just print on arrival: it checks the handover contract — CS is 0,
+`DS:SI` → an entry whose status byte is 0x80 *and* whose start LBA equals this volume's
+hidden-sectors field, `DL` is a hard disk — and prints `SIRIUS-VBR-BAD:x` naming the first
+check that fails, or `SIRIUS-VBR-OK dl=NN`. Each check was seen to catch a variant of the
+MBR with that one bug put in (`lea si, [di + 16]`, `inc dword [di + 8]`, `xor dl, dl`,
+`jmp 0x7c0:0`). Each refusal — no active partition, two active, a status byte that is
+neither 0x00 nor 0x80, an active partition without 0x55AA — was seen to print, and seen
+to go missing under an MBR that prints nothing. The selftest itself was seen to exit 1 for
+a wrong handover and for a missing message, by running it on a copy of the tree with the
+bug put in; the repo's `mbr.asm` was never touched to do it.
+
+Of the three assumptions flagged last time:
+
+- **The CHS fallback cannot work as written.** Forced (`jc .chs` → `jmp .chs`) it prints
+  `read error`. The partition entry says C=0 H=32 S=33 — sfdisk's assumed 255-head
+  geometry — and that is not the geometry SeaBIOS gives a 512 MiB disk, so head 32 does
+  not exist. No modern partitioner computes CHS fields against the BIOS's geometry, so
+  trusting them is trusting nothing. Failing loudly is the right half. If the fallback
+  stays it must convert LBA → CHS from `INT 13h AH=08h`; otherwise drop it and keep the
+  message. Decide when committing `mbr.bin`, below.
+- **Refusing two active partitions is settled** in favour of refusing: syslinux and ReactOS
+  do (see the Rufus section), and MBR media this project writes will be ours to mark, so
+  exactly one active entry is a guarantee we can make rather than a hope.
+- **`DL` remains open.** qemu passes 0x80; the marker prints the value so real firmware
+  can be checked. The usual defence — force 0x80 when bit 7 is clear — is cheap, and the
+  case for it is a firmware survey, not a test that can be run here.
+
+**`boottest.py vbr` was run for the first time, and is case 4 of the selftest.** The splice
+itself was right — every byte of the installed sector was traced to its source, and `fsck.fat`,
 `blkid` and `file` all read the volume as before. Everything around the splice was wrong,
 and every failure was silent:
 
@@ -316,24 +347,16 @@ string is not already there.
 
 **The next action, in order:**
 
-1. **Write `scripts/boot/marker_vbr.asm`** — 512 bytes, `jmp short` at 0x00, zeros through
-   0x59 for the BPB the installer splices in, code from 0x5A. It should not just print a
-   marker: it should check the handover contract and print a *different* marker if it is
-   wrong. That turns "it booted" into "it handed over correctly", which is the part worth
-   testing. The contract `mbr.asm` promises is `DS:SI` → the 16-byte partition entry it
-   booted (so `[si]` is 0x80) and `DL` → the drive.
-2. **Add the cases to `selftest`**, each of which must be seen to fail before it is
-   believed: chainload reaches the VBR; no active partition prints `no active partition`
-   rather than halting silently; two active entries print `bad partition table`; a
-   partition whose first sector lacks 0x55AA prints `not a boot sector`.
-3. **Commit `mbr.bin` beside the source, with a CI step that reassembles and diffs.**
-   Core will `include_bytes!` it, and making the build run `nasm` would put an assembler on
-   the critical path for the macOS and Windows jobs. The diff is what stops the committed
-   binary drifting from the source it claims to be.
-4. **Then the FAT32 volume boot record** (~400 bytes): read the BPB, walk the FAT to find
+1. **Settle the CHS fallback (above), then commit `mbr.bin` beside the source, with a CI
+   step that reassembles and diffs.** Core will `include_bytes!` it, and making the build
+   run `nasm` would put an assembler on the critical path for the macOS and Windows jobs.
+   The diff is what stops the committed binary drifting from the source it claims to be.
+2. **Then the FAT32 volume boot record** (~400 bytes): read the BPB, walk the FAT to find
    `BOOTMGR` in the root directory, load it, jump. This is the harder half — the MBR reads
-   one sector at a fixed offset, the VBR has to traverse a filesystem.
-5. **Then wire both into the flasher and open the gate.** `format.rs:323` `buildable()` is
+   one sector at a fixed offset, the VBR has to traverse a filesystem. `marker_vbr.asm` is
+   the layout to start from, and `put BOOTMGR` (selftest case 3) already stages the file it
+   has to find.
+3. **Then wire both into the flasher and open the gate.** `format.rs:323` `buildable()` is
    the single place that refuses BIOS, and its message names the reason — it must stop
    being true before it stops being returned.
 
@@ -368,7 +391,7 @@ Three things the decode showed that matter for the work ahead:
   i.e. sector 0 plus a continuation), `_0x3f0` and `_0x1800` — spread across the reserved
   area. A single-sector VBR of ~420 code bytes is a *tighter* target than Microsoft set
   itself; if it will not fit, the honest design is a two-stage loader with stage 2 in the
-  reserved sectors, which is what they did. Decide this before writing step 4, not during.
+  reserved sectors, which is what they did. Decide this before writing step 2, not during.
 - **Refusing two active partitions is the norm, not strictness.** `mbr_syslinux.h` and
   `mbr_gpt_syslinux.h` both carry `Multiple active partitions`; `mbr_reactos.h` carries
   `no active partition found`, `read error while reading drive` and `partition signature
@@ -414,7 +437,7 @@ greppable; no screenshots.
 
 **This is built: `scripts/boottest.py`.** `build` makes the media, `mbr` and `vbr` install
 boot code, `put` writes a file into the FAT32 volume, `run` boots it and prints the screen.
-`selftest` runs the whole thing in about five seconds and is a `boot` job in CI.
+`selftest` runs the whole thing in about eight seconds and is a `boot` job in CI.
 
 The selftest is a **negative** test before it is a positive one. It asserts that media with
 no boot code is reported as dead — SeaBIOS reaches `Booting from Hard Disk...` and then
