@@ -34,6 +34,10 @@ CI runs this across Ubuntu, macOS and Windows. `cargo fmt --check` runs first, s
 unformatted tree hides every later failure. Linux-only imports must be `cfg`-gated or
 `clippy -D warnings` fails the other two platforms on unused imports.
 
+If `scripts/boottest.py`, `scripts/boot/` or `crates/core/boot/` changed, also run
+`./scripts/boottest.py selftest` (needs `qemu-system-x86_64`, `nasm`, `mkfs.fat`). CI's
+`boot` job runs it too, but a broken boot sector is cheaper to see in eight seconds here.
+
 ## Commits
 
 Conventional Commits (`feat(core):`, `fix(cli):`, `chore(security):`). Keep the subject in

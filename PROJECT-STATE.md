@@ -3,12 +3,31 @@
 Living handoff document. Anyone (or any new session) picking this up cold should read
 this file first, then `README.md`, then `SECURITY.md`.
 
-**Last updated:** 2026-09-28. For the commit this describes, ask git —
+**Last updated:** 2026-10-22. For the commit this describes, ask git —
 `git log -1 --format=%h PROJECT-STATE.md`. A hash written into the file by hand
 names the commit *before* the one containing it, and this one had drifted five
 commits before anyone noticed.
 
 ---
+
+## 0. Resume here — checkpoint 2026-10-22
+
+Branch **`main`**; local and `origin` were identical at `bd12f71` with nothing uncommitted
+when this was written. Cloud sessions work on a branch instead (`CLAUDE.md`).
+
+- **Verified, not just written:** `crates/core/boot/mbr.asm` chainloads under qemu +
+  SeaBIOS (TCG), hands over correctly, and refuses bad media aloud — selftest cases 5-8,
+  which CI runs on every push. `boottest.py vbr` installs correctly (case 4). **Never on
+  real hardware**, and the CHS fallback is known not to work (§6).
+- **Written, not wired:** nothing in Rust references `mbr.asm`; `buildable()` still refuses
+  every BIOS target. There is no FAT32 VBR yet.
+- **Do first:** the `Security` workflow has been red on `main` since the 2026-10-19
+  scheduled run — four advisories against crates we ship, two Dependabot PRs fix them
+  (§8). A red audit on a tool that writes disks is not a backlog item.
+- **Then:** §6 "Boot sectors", step 1 — settle the CHS fallback and commit `mbr.bin`.
+- **Before trusting this section:** `git fetch`, `gh run list`, `gh pr list`. The GitHub
+  side moves between sessions; the 2026-10-22 resume found 16 more Dependabot PRs than §8
+  recorded.
 
 ## 1. What this is
 
@@ -483,16 +502,29 @@ support · bad-block check.
 
 ## 8. Open items
 
-- **Dependabot PR #5 is open** (`clap 4.6.6 → 4.6.7`, 2026-09-21), unreviewed: the session
-  that would have handled it was asked to stop. A patch bump on a CLI parser; expect it to
-  merge unchanged, but look. Otherwise Dependabot is clear. `actions/checkout@7`, `typescript 7.0.2`
-  and `sha2 0.11.0` merged unchanged. `ruzstd 0.9.0` needed a code change, so it was made
-  here and PR #1 closed — and it did **not** close itself when the push landed: a different
-  commit making the same change is invisible to GitHub, so that had to be done by hand.
-  Expect the same of any future Dependabot PR whose upgrade needs code. 0.9 moved
-  `StreamingDecoder` into `ruzstd::decoding` **and** started applying its 100 MB window
-  cap to the first frame, which would have silently refused every `zstd --long` image —
-  hence `MAX_ZSTD_WINDOW`.
+- **`Security` is red on `main`: four advisories, since the 2026-10-19 scheduled
+  `cargo audit`.** The 10-12 run was green; the advisory database moved, not the code. All
+  four are in the workspace `Cargo.lock`, and so in `app/src-tauri/Cargo.lock` as well,
+  which links the same crates through `sirius-flash-core`:
+  - `ruzstd 0.9.0` — RUSTSEC-2026-0344, "a tiny input can exhaust memory", high. Fix is
+    ≥ 0.9.1: **Dependabot PR #25**. Do not count on `MAX_ZSTD_WINDOW` as the defence — it
+    is 4 GiB, deliberately, to admit `zstd --long` images.
+  - `zip 8.6.0` — RUSTSEC-2026-0367 / -0368 / -0369: SUID bits and symlink targets in
+    `extract()`, up to critical. Fix is ≥ 9.0.0: **PR #24** (`9.0.4`). We never call
+    `extract()` — `blockio.rs` scans with `by_index_raw` and streams one member — so none
+    of the three can reach a user, but the audit cannot know that, and a major bump may
+    need code. Keep `default-features = false, features = ["deflate-flate2"]` (§6 notes).
+
+  Regenerate both lockfiles and run `cargo audit` on both before calling this closed.
+- **17 Dependabot PRs are open** (#5, #6, #9, #10, #13–18, #20–26; opened 2026-09-21 to
+  2026-10-20), none reviewed: the two above, `clap` (#5), `tauri` (#6), `sha2` (#23),
+  `actions/*` (#9, #10), and Tauri-plugin and frontend bumps under `app/`. History that
+  still applies: `ruzstd 0.9.0` needed a code change, so it was made here and PR #1
+  closed — and it did **not** close itself when the push landed: a different commit making
+  the same change is invisible to GitHub, so that had to be done by hand. Expect the same
+  of any PR whose upgrade needs code. 0.9 moved `StreamingDecoder` into `ruzstd::decoding`
+  **and** started applying its 100 MB window cap to the first frame, which would have
+  silently refused every `zstd --long` image — hence `MAX_ZSTD_WINDOW`.
 - `RUSTSEC-2024-0429` (`glib`) is accepted and documented in `SECURITY.md`; it arrives via
   Tauri's GTK stack and has no fixed version reachable from here. Re-check periodically.
 - **The Tauri app was invisible to CI, and that had already cost something.** It is
