@@ -24,6 +24,7 @@ Requires: sfdisk, mkfs.fat, qemu-system-x86_64, nasm (selftest only), python3.
 
 import argparse
 import os
+import random
 import shutil
 import socket
 import struct
@@ -265,72 +266,143 @@ def cmd_vbr(a):
 
 
 def cmd_put(a):
+    """Write a file into the FAT32 root directory.
+
+    Clusters come from the first free run unless --scatter asks for them spread
+    across the FAT and chained in descending order — what a loader that assumes
+    a contiguous file, or a chain within one FAT sector, has to be shown. The
+    root directory grows by a cluster when it is full, for the same reason: a
+    loader that scans only the first root cluster passes every tidy volume.
+    --attr, --raw-name, --deleted and --lfn plant decoys around BOOTMGR: a
+    directory that spells its name, a deleted copy, a long-name part.
+    """
     data = open(a.source, "rb").read()
     bpb = read_bpb(a.image, a.start)
-    name = a.name.upper()
-    stem, _, ext = name.partition(".")
-    if len(stem) > 8 or len(ext) > 3:
-        sys.exit(f"{a.name!r} is not an 8.3 name")
-    entry_name = stem.ljust(8)[:8] + ext.ljust(3)[:3]
+    raw_name = getattr(a, "raw_name", None)
+    if raw_name is not None:
+        if len(raw_name) != 11:
+            sys.exit("--raw-name must be exactly 11 characters")
+        entry_name = raw_name
+    else:
+        name = a.name.upper()
+        stem, _, ext = name.partition(".")
+        if len(stem) > 8 or len(ext) > 3:
+            sys.exit(f"{a.name!r} is not an 8.3 name")
+        entry_name = stem.ljust(8)[:8] + ext.ljust(3)[:3]
+    attr = int(getattr(a, "attr", "0x20"), 0)
+    deleted = getattr(a, "deleted", False)
+    scatter = getattr(a, "scatter", False)
+    lfn = getattr(a, "lfn", None)
 
     clus_bytes = bpb.sec_per_clus * SECTOR
-    needed = max(1, -(-len(data) // clus_bytes))
+    # An empty file, a label and a deleted entry own no clusters: the cluster
+    # field is 0 and fsck.fat holds the volume to that.
+    needed = 0 if (not data or deleted) else -(-len(data) // clus_bytes)
 
     with open(a.image, "r+b") as f:
+        # The first FAT, in memory: one read instead of one per cluster.
+        f.seek(bpb.fat_lba * SECTOR)
+        fat = bytearray(f.read(bpb.fat_sz32 * SECTOR))
+
         def fat_read(n):
-            f.seek(bpb.fat_lba * SECTOR + n * 4)
-            return int.from_bytes(f.read(4), "little") & 0x0FFFFFFF
+            return int.from_bytes(fat[n * 4 : n * 4 + 4], "little") & 0x0FFFFFFF
 
         def fat_write(n, val):
             # The top 4 bits of a FAT32 entry are reserved and must be kept.
+            old = int.from_bytes(fat[n * 4 : n * 4 + 4], "little")
+            new = ((old & 0xF0000000) | (val & 0x0FFFFFFF)).to_bytes(4, "little")
+            fat[n * 4 : n * 4 + 4] = new
             for copy in range(bpb.num_fats):
-                off = (bpb.fat_lba + copy * bpb.fat_sz32) * SECTOR + n * 4
-                f.seek(off)
-                old = int.from_bytes(f.read(4), "little")
-                f.seek(off)
-                f.write(((old & 0xF0000000) | (val & 0x0FFFFFFF)).to_bytes(4, "little"))
+                f.seek((bpb.fat_lba + copy * bpb.fat_sz32) * SECTOR + n * 4)
+                f.write(new)
 
-        total = bpb.fat_sz32 * SECTOR // 4
-        chain, n = [], 2
-        while len(chain) < needed and n < total:
-            if fat_read(n) == 0 and n != bpb.root_clus:
-                chain.append(n)
-            n += 1
-        if len(chain) < needed:
-            sys.exit(f"no room: need {needed} clusters, found {len(chain)}")
+        def allocate(count):
+            pool = [n for n in range(2, bpb.clusters + 2)
+                    if n != bpb.root_clus and fat_read(n) == 0]
+            if scatter:
+                # Every fifth free cluster, highest first: the chain descends,
+                # jumps, and runs through many FAT sectors.
+                pool = pool[::5][::-1]
+            if len(pool) < count:
+                sys.exit(f"no room: need {count} clusters, found {len(pool)}"
+                         + (" (every fifth free one, with --scatter)" if scatter else ""))
+            return pool[:count]
 
+        chain = allocate(needed)
+        if chain and attr & 0x10 and data[:11] == b".          ":
+            # A directory's "." entry names its own cluster, which is only known now.
+            data = bytearray(data)
+            data[20:22] = struct.pack("<H", chain[0] >> 16)
+            data[26:28] = struct.pack("<H", chain[0] & 0xFFFF)
+        # The rest of the last cluster is padded with 0xA5, not zeros: a loader
+        # that reads whole clusters, or one sector too many, then carries
+        # bytes past the end of the file into memory where the stand-in
+        # BOOTMGR can see them. (Directories stay zero-padded; 0x00 is their
+        # end marker.)
+        pad = b"\0" if attr & 0x10 else b"\xA5"
         for i, c in enumerate(chain):
             fat_write(c, 0x0FFFFFFF if i == len(chain) - 1 else chain[i + 1])
             f.seek(bpb.cluster_lba(c) * SECTOR)
-            f.write(data[i * clus_bytes : (i + 1) * clus_bytes].ljust(clus_bytes, b"\0"))
-
-        # Root directory: first free slot in the cluster chain. Deliberately no
-        # extension of the chain — failing loudly beats half-writing a directory.
-        slot = None
-        clus = bpb.root_clus
-        while slot is None and 2 <= clus < 0x0FFFFFF8:
-            base = bpb.cluster_lba(clus) * SECTOR
-            f.seek(base)
-            block = f.read(clus_bytes)
-            for i in range(0, clus_bytes, 32):
-                if block[i] in (0x00, 0xE5):
-                    slot = base + i
-                    break
-            clus = fat_read(clus)
-        if slot is None:
-            sys.exit("root directory is full")
+            f.write(bytes(data[i * clus_bytes : (i + 1) * clus_bytes]).ljust(clus_bytes, pad))
 
         # A directory entry is exactly 32 bytes and every field is positional:
         #   0-10 name   11 attr   12-19 NT/creation/access   20-21 cluster hi
         #   22-25 write time+date   26-27 cluster lo   28-31 size
         # One byte too many in the padding shifts the tail by one, and the size
         # then reads 256x too large while the cluster number points at nothing.
-        entry = (entry_name.encode("ascii") + bytes([0x20]) + b"\0" * 8
-                 + struct.pack("<H", chain[0] >> 16) + b"\0" * 4
-                 + struct.pack("<HI", chain[0] & 0xFFFF, len(data)))
+        first = chain[0] if chain else 0
+        size = 0 if attr & 0x10 else len(data)
+        entry = (entry_name.encode("ascii") + bytes([attr]) + b"\0" * 8
+                 + struct.pack("<H", first >> 16) + b"\0" * 4
+                 + struct.pack("<HI", first & 0xFFFF, size))
         assert len(entry) == 32, len(entry)
+        if deleted:
+            entry = b"\xE5" + entry[1:]
+        entries = [entry]
+        if lfn:
+            # One long-name part ahead of the short entry: sequence 1 and
+            # "last" flag, 13 UCS-2 characters split 5/6/2, attribute 0x0F,
+            # and the checksum of the short name that makes it valid.
+            if len(lfn) > 13:
+                sys.exit("--lfn supports one part, up to 13 characters")
+            chk = 0
+            for b in entry_name.encode("ascii"):
+                chk = (((chk & 1) << 7) | (chk >> 1)) + b & 0xFF
+            chars = [ord(c) for c in lfn] + [0] + [0xFFFF] * 12
+            u = lambda seq: b"".join(struct.pack("<H", c) for c in seq)
+            part = (bytes([0x41]) + u(chars[0:5]) + bytes([0x0F, 0, chk])
+                    + u(chars[5:11]) + b"\0\0" + u(chars[11:13]))
+            assert len(part) == 32, len(part)
+            entries = [part, entry]
+
+        # Root directory: the first run of never-used slots long enough. A real
+        # driver would reuse deleted (0xE5) slots too; this one does not, so a
+        # deleted entry planted as a decoy stays where it was planted. If there
+        # is no run, the directory grows by one cluster, chained and zeroed.
+        slot = None
+        clus = bpb.root_clus
+        last_root = clus
+        while slot is None and 2 <= clus < 0x0FFFFFF8:
+            base = bpb.cluster_lba(clus) * SECTOR
+            f.seek(base)
+            block = f.read(clus_bytes)
+            run = 0
+            for i in range(0, clus_bytes, 32):
+                run = run + 1 if block[i] == 0x00 else 0
+                if run == len(entries):
+                    slot = base + i - 32 * (len(entries) - 1)
+                    break
+            last_root = clus
+            clus = fat_read(clus)
+        if slot is None:
+            [grown] = allocate(1)
+            fat_write(last_root, grown)
+            fat_write(grown, 0x0FFFFFFF)
+            f.seek(bpb.cluster_lba(grown) * SECTOR)
+            f.write(b"\0" * clus_bytes)
+            slot = bpb.cluster_lba(grown) * SECTOR
         f.seek(slot)
-        f.write(entry)
+        f.write(b"".join(entries))
 
         # FSInfo's free-cluster count is now stale. It is advisory — boot code
         # never reads it — but leaving it wrong makes `fsck.fat` report a
@@ -339,10 +411,11 @@ def cmd_put(a):
         if bpb.fs_info:
             free = sum(1 for n in range(2, bpb.clusters + 2) if fat_read(n) == 0)
             f.seek((bpb.part_start + bpb.fs_info) * SECTOR + 0x1E8)
-            f.write(struct.pack("<II", free, chain[-1]))
+            f.write(struct.pack("<II", free, chain[-1] if chain else 0xFFFFFFFF))
 
-    print(f"wrote {a.name} ({len(data)} bytes, {needed} cluster(s) from {chain[0]})")
-
+    how = "scattered" if scatter else "contiguous"
+    where = f"{needed} cluster(s) from {first}, {how}" if chain else "no clusters"
+    print(f"wrote {entry_name.strip()!s} ({len(data)} bytes, {where})")
 
 # --------------------------------------------------------------------------- #
 # run
@@ -361,7 +434,7 @@ def decode_vga(raw):
     return out
 
 
-def boot_and_read(image, expect=None, timeout=25, settle=0.0):
+def boot_and_read(image, expect=None, timeout=25, settle=0.0, floppy=False):
     """Boot the image and return the screen as 25 lines of text.
 
     Stops as soon as `expect` appears, so a passing run costs a second or two
@@ -373,8 +446,17 @@ def boot_and_read(image, expect=None, timeout=25, settle=0.0):
     to the MBR, so a screen captured the instant that text appears has not yet
     given the boot code a chance to run, and would show an empty screen for
     working and broken media alike.
+
+    `floppy` attaches the image as drive A and nothing as a hard disk, so the
+    BIOS hands the boot sector DL=0x00 and there is no drive 0x80 to fall back
+    to. It exists for the one MBR path that needs exactly that machine.
     """
     need_tools()
+    # One string, or several: any of them ends the wait. A case that can end in
+    # either a marker or an MBR message names both, so the wrong outcome is
+    # reported at once rather than after the timeout.
+    if isinstance(expect, str):
+        expect = (expect,)
     with tempfile.TemporaryDirectory() as tmp:
         # The dump filename passed to `memsave` must be RELATIVE, so qemu is
         # started with its working directory here. The HMP parser treats a
@@ -387,7 +469,8 @@ def boot_and_read(image, expect=None, timeout=25, settle=0.0):
         sock, dump = os.path.join(tmp, "mon"), "vga.bin"
         qemu = subprocess.Popen(
             ["qemu-system-x86_64", "-machine", "pc", "-accel", "tcg", "-m", "64",
-             "-drive", f"file={os.path.abspath(image)},format=raw,if=ide",
+             *(["-fda", os.path.abspath(image), "-boot", "a"] if floppy else
+               ["-drive", f"file={os.path.abspath(image)},format=raw,if=ide"]),
              "-display", "none", "-vga", "std",
              # Freeze rather than reboot or exit. A boot sector that faults
              # resets the machine; -no-reboot would make qemu exit and take the
@@ -421,7 +504,7 @@ def boot_and_read(image, expect=None, timeout=25, settle=0.0):
                         screen = decode_vga(raw)
                 except OSError:
                     continue
-                if expect and any(expect in l for l in screen):
+                if expect and any(e in l for e in expect for l in screen):
                     if settle <= 0:
                         break
                     deadline, expect, settle = time.time() + settle, None, 0
@@ -614,7 +697,7 @@ def cmd_selftest(a):
             if check.returncode != 0 or "differences between boot sector" in check.stdout:
                 failed.append("case 4: fsck.fat objects to the volume after vbr")
 
-        # Cases 5-8 boot crates/core/boot/mbr.asm, the MBR this project will
+        # Cases 5-15 boot crates/core/boot/mbr.asm, the MBR this project will
         # ship. Case 5 is the positive one, and it asks more than "the VBR
         # ran": marker_vbr.asm checks the handover contract — CS:IP, DS:SI ->
         # the entry booted, DL -> the drive — and prints a different marker
@@ -625,9 +708,24 @@ def cmd_selftest(a):
         # from a dead one. Every message was seen to be missing under an MBR
         # that does not print it.
         print("\n--- case 5: the MBR chainloads, and the handover is checked ---")
+        mbr_src = os.path.join(here, "..", "crates", "core", "boot", "mbr.asm")
         real_mbr = os.path.join(tmp, "mbr.bin")
-        sh("nasm", "-f", "bin",
-           os.path.join(here, "..", "crates", "core", "boot", "mbr.asm"), "-o", real_mbr)
+        sh("nasm", "-f", "bin", mbr_src, "-o", real_mbr)
+        # The binary beside the source is what core ships (include_bytes!, so
+        # that building on macOS and Windows needs no assembler). It is only
+        # worth anything while it is what the source assembles to, and nothing
+        # but a comparison can say so. nasm 2.16 and 3.x were checked to agree
+        # byte for byte on this source, so a difference here is drift, not an
+        # assembler version.
+        committed = os.path.join(here, "..", "crates", "core", "boot", "mbr.bin")
+        if not os.path.exists(committed):
+            failed.append("case 5: crates/core/boot/mbr.bin is missing; assemble mbr.asm "
+                          "and commit the result beside it")
+        elif open(committed, "rb").read() != open(real_mbr, "rb").read():
+            failed.append("case 5: crates/core/boot/mbr.bin is not what mbr.asm assembles "
+                          "to; reassemble it (nasm -f bin mbr.asm -o mbr.bin) and commit both")
+        else:
+            print("crates/core/boot/mbr.bin matches the source")
         marker_vbr = os.path.join(tmp, "marker_vbr.bin")
         sh("nasm", "-f", "bin", os.path.join(here, "boot", "marker_vbr.asm"),
            "-o", marker_vbr)
@@ -672,6 +770,123 @@ def cmd_selftest(a):
         refusal(7, "two active partitions", table + 16, b"\x80", "bad partition table")
         refusal(8, "the active partition is not a boot sector",
                 2048 * SECTOR + 510, b"\x00\x00", "not a boot sector")
+
+        # Cases 9-15 reach the paths SeaBIOS cannot: it always offers INT 13h
+        # extensions and always passes DL=0x80. mbr.asm has two symbols for
+        # exactly this -- SIRIUS_TEST_FORCE_CHS pretends the extensions are
+        # absent, SIRIUS_TEST_DL=n pretends the BIOS handed over drive n -- and
+        # the shipped binary is assembled without either, which case 5 has just
+        # checked. Forced to CHS, the previous MBR read the partition entry's
+        # CHS fields (sfdisk's assumed 255-head geometry, not SeaBIOS's) and
+        # printed "read error"; this one converts the LBA against what AH=08h
+        # reports. Drive 0x00 is GRUB's documented firmware bug, 0x81 syslinux's.
+        # SeaBIOS answers AH=08h for 0x00 with a floppy geometry and then fails
+        # the read; for 0x81 it fails AH=08h itself. Either way the retry with
+        # 0x80 is what reaches the VBR -- which prints the DL it was given.
+        built = {}
+
+        def build(define):
+            if define in built:
+                return built[define]
+            binary = os.path.join(tmp, f"mbr-{define.split('=')[0]}-{define.split('=')[-1]}.bin")
+            sh("nasm", "-f", "bin", f"-D{define}", mbr_src, "-o", binary)
+            # A hook that no longer assembles anything leaves a build identical
+            # to the shipped one, and a case that then passes tests nothing.
+            if open(binary, "rb").read() == open(real_mbr, "rb").read():
+                failed.append(f"the {define} build is identical to the plain one: the hook "
+                              f"is dead, and every case built with it is vacuous")
+            built[define] = binary
+            return binary
+
+        def variant(case, what, define, expect):
+            print(f"\n--- case {case}: {what} ---")
+            cmd_mbr(argparse.Namespace(image=img, binary=build(define)))
+            screen = boot_and_read(img, expect=("SIRIUS-VBR-", "Sirius: "), timeout=a.timeout)
+            show(screen)
+            if any(expect in l for l in screen):
+                print(f"\n{expect!r} is on screen")
+            else:
+                failed.append(f"case {case}: {what}, and {expect!r} did not appear")
+
+        variant(9, "no INT 13h extensions: CHS computed from the BIOS geometry",
+                "SIRIUS_TEST_FORCE_CHS", "SIRIUS-VBR-OK")
+        variant(10, "the BIOS passes DL=0x00 for the disk it booted",
+                "SIRIUS_TEST_DL=0x00", "SIRIUS-VBR-OK dl=80")
+        variant(11, "the BIOS passes DL=0x81 for the first disk",
+                "SIRIUS_TEST_DL=0x81", "SIRIUS-VBR-OK dl=80")
+
+        # Case 9 proved the conversion on LBA 2048 alone, which on the 32-head
+        # 63-sector geometry SeaBIOS gives a 512 MiB disk is cylinder 1, head 0,
+        # sector 33: cylinder bits 9:8, a non-zero head and the instructions
+        # that pack them were never exercised, and six mutations of them passed
+        # the selftest. LBA 518434 is cylinder 257, head 5, sector 8.
+        print("\n--- case 12: forced CHS with the partition deep in the geometry ---")
+        deep = os.path.join(tmp, "deep.img")
+        cmd_build(argparse.Namespace(image=deep, size_mib=512, label="BOOTTEST",
+                                     start=518434, sec_per_clus=1))
+        cmd_vbr(argparse.Namespace(image=deep, binary=marker_vbr, start=518434))
+        cmd_mbr(argparse.Namespace(image=deep, binary=build("SIRIUS_TEST_FORCE_CHS")))
+        screen = boot_and_read(deep, expect=("SIRIUS-VBR-", "Sirius: "), timeout=a.timeout)
+        show(screen)
+        if any("SIRIUS-VBR-OK" in l for l in screen):
+            print("\n'SIRIUS-VBR-OK' is on screen")
+        else:
+            failed.append("case 12: forced CHS did not reach the VBR at LBA 518434")
+
+        # An 8 GiB disk gets 255 heads x 63 sectors, so cylinder 1024 begins at
+        # LBA 16450560, which CHS cannot name. A partition starting exactly
+        # there boots by LBA, and forced to CHS the MBR must refuse aloud: a
+        # wrapped cylinder number reads a real sector that is the wrong one,
+        # here the MBR itself, which would run again in silence forever.
+        print("\n--- case 13: a partition beyond cylinder 1023: LBA boots it, CHS refuses it ---")
+        far = os.path.join(tmp, "far.img")
+        cmd_build(argparse.Namespace(image=far, size_mib=8192, label="BOOTTEST",
+                                     start=16450560, sec_per_clus=1))
+        cmd_vbr(argparse.Namespace(image=far, binary=marker_vbr, start=16450560))
+        cmd_mbr(argparse.Namespace(image=far, binary=real_mbr))
+        screen = boot_and_read(far, expect=("SIRIUS-VBR-", "Sirius: "), timeout=a.timeout)
+        show(screen)
+        if any("SIRIUS-VBR-OK" in l for l in screen):
+            print("\nby LBA: 'SIRIUS-VBR-OK' is on screen")
+        else:
+            failed.append("case 13: the shipped MBR did not boot a partition beyond cylinder 1023 by LBA")
+        cmd_mbr(argparse.Namespace(image=far, binary=build("SIRIUS_TEST_FORCE_CHS")))
+        screen = boot_and_read(far, expect=("SIRIUS-VBR-", "Sirius: "), timeout=a.timeout)
+        show(screen)
+        if any("Sirius: read error" in l for l in screen):
+            print("\nforced CHS: the MBR said so: 'read error'")
+        else:
+            failed.append("case 13: forced CHS beyond cylinder 1023 did not say 'read error'")
+
+        # Nothing above reaches "read error" on the shipped build, so nothing
+        # above would notice the retry looping forever. An active partition
+        # past the end of the disk fails every read of drive 0x80, and the
+        # only right answer is to say so.
+        cmd_mbr(argparse.Namespace(image=img, binary=real_mbr))
+        refusal(14, "the active partition starts past the end of the disk",
+                table + 8, (0x00400000).to_bytes(4, "little"), "read error")
+
+        # The one path left is the retry's own give-up, and it needs a machine
+        # with no hard disk at all. Booted as a floppy, the BIOS passes DL=0x00
+        # -- GRUB's case exactly; the active entry's LBA lies beyond the
+        # floppy, so the read fails and the retry switches to 0x80, which does
+        # not exist. The guard turns that into "read error"; without it the
+        # MBR asks for drive 0x80 forever, in silence. (The partition entry is
+        # written by hand: sfdisk will not place one past the end of a disk.)
+        print("\n--- case 15: booted as a floppy on a machine with no hard disk ---")
+        fd = os.path.join(tmp, "floppy.img")
+        sector = bytearray(open(real_mbr, "rb").read().ljust(446, b"\0"))
+        sector += (bytes([0x80, 0, 0, 0, 0x0C, 0, 0, 0])
+                   + (4000).to_bytes(4, "little") + (1).to_bytes(4, "little"))
+        sector = sector.ljust(510, b"\0") + b"\x55\xaa"
+        with open(fd, "wb") as f:
+            f.write(bytes(sector).ljust(1474560, b"\0"))
+        screen = boot_and_read(fd, expect=("Sirius: ",), timeout=a.timeout, floppy=True)
+        show(screen)
+        if any("Sirius: read error" in l for l in screen):
+            print("\nthe MBR said so: 'read error'")
+        else:
+            failed.append("case 15: with no hard disk to fall back to, the MBR did not say 'read error'")
     finally:
         if a.keep:
             print(f"\nkept: {tmp}")
@@ -683,8 +898,8 @@ def cmd_selftest(a):
         for f in failed:
             print(f"  - {f}", file=sys.stderr)
         return 1
-    print("\nSELFTEST PASSED: the harness detects a booting MBR and a dead one, "
-          "and ours chainloads, refuses, and hands over correctly")
+    print("\nSELFTEST PASSED: the harness detects a booting MBR and a dead one, and ours "
+          "chainloads, refuses, hands over correctly, and copes with CHS-only and wrong-DL firmware")
     return 0
 
 
@@ -720,6 +935,12 @@ def main():
     t.add_argument("source")
     t.add_argument("name", help="8.3 name, e.g. BOOTMGR")
     t.add_argument("--start", type=int, default=2048)
+    t.add_argument("--attr", default="0x20", help="directory-entry attribute byte")
+    t.add_argument("--raw-name", help="the 11 name bytes verbatim, instead of NAME")
+    t.add_argument("--deleted", action="store_true", help="write the entry as deleted (0xE5)")
+    t.add_argument("--scatter", action="store_true",
+                   help="spread the clusters over the FAT, chained in descending order")
+    t.add_argument("--lfn", help="precede the entry with one long-name part (<= 13 chars)")
     t.set_defaults(func=cmd_put)
 
     r = sub.add_parser("run", help="boot the image and print the screen")

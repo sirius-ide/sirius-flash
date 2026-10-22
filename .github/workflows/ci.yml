@@ -99,9 +99,10 @@ jobs:
   # Cases 1-4 are a negative test as much as a positive one: media with no boot
   # code must be reported as dead before a known-good sector is reported as
   # alive, because a rig that has only ever seen a pass cannot be told apart
-  # from one that always passes. Cases 5-8 then boot crates/core/boot/mbr.asm:
-  # it must chainload with the handover contract intact, and refuse bad media
-  # aloud rather than halt in silence.
+  # from one that always passes. Cases 5-15 then boot crates/core/boot/mbr.asm:
+  # it must chainload with the handover contract intact, refuse bad media
+  # aloud rather than halt in silence, and cope with firmware that lacks INT
+  # 13h extensions or names the wrong drive.
   #
   # Everything runs unprivileged under TCG, so no KVM and no root: this works in
   # a container as well as it does on a laptop.
@@ -114,5 +115,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 nasm dosfstools
+      # crates/core/boot/mbr.bin is the binary core ships (include_bytes!, so
+      # the macOS and Windows jobs need no assembler). This diff is what stops
+      # it drifting from the source it claims to be. The selftest checks the
+      # same thing; this step just names the failure plainly.
+      - name: mbr.bin is what mbr.asm assembles to
+        run: |
+          nasm -f bin crates/core/boot/mbr.asm -o /tmp/mbr.bin
+          cmp /tmp/mbr.bin crates/core/boot/mbr.bin
       - name: Boot-test harness selftest
         run: ./scripts/boottest.py selftest

@@ -14,9 +14,16 @@
 ;
 ; Assembled to exactly 440 bytes: 440-443 is the disk identifier and 446-509 the
 ; partition table, and an MBR that overwrites either is not an MBR any more.
+; mbr.bin beside this file is the binary core will ship, and must be what this
+; source assembles to (nasm's default optimisation; 2.16 and 3.x agree byte for
+; byte). The selftest and CI both check that, so a change here is a change there.
 ;
 ; 386 instructions: reading a 32-bit LBA out of the partition entry needs 32-bit
 ; registers. Nothing that boots off USB predates a 386 by twenty years.
+;
+; Two symbols exist for the selftest only, and the shipped binary is assembled
+; without either: SIRIUS_TEST_FORCE_CHS pretends the BIOS has no INT 13h
+; extensions, SIRIUS_TEST_DL=n pretends it handed over drive n.
 
 bits 16
 cpu 386
@@ -44,6 +51,9 @@ start:
 
 main:
     sti
+%ifdef SIRIUS_TEST_DL
+    mov dl, SIRIUS_TEST_DL          ; test builds only
+%endif
     mov [drive], dl                 ; the VBR needs this too; keep it somewhere safe
 
 ; --- find the one active partition ------------------------------------------
@@ -63,6 +73,8 @@ main:
     test di, di
     jnz .bad_table
     mov di, si
+    cmp dword [si + 8], 0           ; a partition at LBA 0 is this sector: reading
+    je .bad_table                   ; it and jumping to it would run us forever
     jmp .next
 .inactive:
     test al, al
@@ -79,16 +91,34 @@ main:
     jmp fail
 
 ; --- read its first sector to 0x7C00 ----------------------------------------
-; LBA first. The CHS fields in a partition entry cap out at 1024 cylinders and
-; are filled in for compatibility rather than for use; on anything made this
-; century they describe a geometry the drive does not have. CHS stays as a
-; fallback because a BIOS that cannot do packet access cannot be told to.
+; LBA first. If the BIOS has no packet interface, or has one and the read still
+; fails (GRUB falls back here too; syslinux learnt to), fall back to CHS — but
+; never to the CHS fields in the partition entry. Partitioners fill those from
+; an assumed 255-head geometry, not from what this BIOS reports, and forced
+; under SeaBIOS that version read a head the disk did not have. The geometry
+; comes from the BIOS itself (AH=08h) and the LBA is converted against it, which
+; is what syslinux's and GRUB's MBRs do. No report of a BIOS booting USB as a
+; hard disk without extensions has been found newer than 2010, so this path may
+; never run; it costs 80 bytes, and the alternative is a stick that only says
+; "read error" on exactly the machine it was asked to help.
+;
+; DL is reloaded from [drive] before every call: AH=41h is known to clobber it
+; on some firmware (GRUB names AST BIOS 1.04).
 
 read:
+    mov word [LOAD + 510], 0        ; forget the 0x55AA the BIOS loaded us with: a
+                                    ; read that returns CF=0 having transferred
+                                    ; nothing would otherwise verify stale bytes and
+                                    ; run this sector again, silently and forever
+    mov word [dap + 2], 1           ; EDD writes the count transferred back here —
+                                    ; 0 after a failure — and the packet is reused
     mov dl, [drive]
     mov ah, 0x41                    ; INT 13h extensions installed?
     mov bx, 0x55aa
     int 0x13
+%ifdef SIRIUS_TEST_FORCE_CHS
+    stc                             ; test builds only: pretend they are not
+%endif
     jc .chs
     cmp bx, 0xaa55
     jne .chs
@@ -101,18 +131,59 @@ read:
     mov dl, [drive]
     mov ah, 0x42
     int 0x13
-    jnc verify                      ; on failure fall through and try CHS: a
-                                    ; drive that advertises packets and then
-                                    ; refuses one has nothing else to offer, but
-                                    ; trying costs two bytes
+    jnc verify
+
 .chs:
-    mov dh, [di + 1]                ; head
-    mov cx, [di + 2]                ; sector in CL (with cylinder high bits), cylinder low in CH
+    ; AH=08h returns CH = max cylinder bits 7:0, CL[7:6] = bits 9:8,
+    ; CL[5:0] = sectors per track, DH = max head, DL = the drive *count*, and on
+    ; floppies ES:DI -> a parameter table. DI is our partition entry: keep it.
+    push di
+    push es
+    mov dl, [drive]
+    mov ah, 0x08
+    int 0x13
+    pop es
+    pop di
+    jc .unread                      ; no such drive
+    movzx ebx, cl
+    and bl, 0x3f                    ; sectors per track
+    jz .give_up                     ; some BIOSes return CF=0 and 0 here
+    movzx esi, dh
+    inc esi                         ; heads = max head + 1
+    mov eax, [di + 8]               ; starting LBA
+    xor edx, edx
+    div ebx                         ; eax = track, edx = sector - 1
+    mov cl, dl
+    inc cl                          ; sectors are 1-based
+    xor edx, edx
+    div esi                         ; eax = cylinder, edx = head
+    cmp eax, 1023                   ; CHS cannot name a higher cylinder; a wrapped
+    ja .give_up                     ; one reads a real sector that is the wrong one
+    mov dh, dl                      ; head
+    mov ch, al                      ; cylinder bits 7:0
+    shl ah, 6
+    or cl, ah                       ; cylinder bits 9:8 -> CL[7:6]
     mov bx, LOAD                    ; ES:BX = buffer, ES is still 0
     mov dl, [drive]
     mov ax, 0x0201                  ; read 1 sector
     int 0x13
     jnc verify
+    cmp byte [drive], 0x80          ; a hard disk that exists and will not read
+    jae .give_up                    ; is a read error, not a wrong number
+
+.unread:
+    ; The drive the BIOS named does not exist, or is a floppy number that will
+    ; not read. Some firmware does hand over the wrong one — 0x00 or 0x01 for a
+    ; disk it booted as 0x80 (GRUB's workaround), 0x81 for the first disk
+    ; (syslinux's "garbage in DL") — so try 0x80 once, the way the Windows 7
+    ; MBR does after its reads fail. Never for a hard disk that merely failed a
+    ; read: a genuine 0x81 with a bad sector must not be answered by booting
+    ; whatever sits at the same LBA of 0x80.
+    cmp byte [drive], 0x80
+    je .give_up
+    mov byte [drive], 0x80
+    jmp read
+.give_up:
     mov si, msg_read
     jmp fail
 
@@ -135,13 +206,15 @@ handover:
 ; depends on which it was.
 
 fail:
+    cld                             ; a BIOS may have returned with DF set
+.print:
     lodsb
     test al, al
     jz .halt
     mov ah, 0x0e                    ; teletype, so it follows the BIOS's cursor
     mov bx, 0x0007
     int 0x10
-    jmp fail
+    jmp .print
 .halt:
     cli
     hlt

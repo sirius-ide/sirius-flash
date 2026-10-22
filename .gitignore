@@ -41,6 +41,9 @@ secrets.*
 # without a word, so this went unnoticed until a clean checkout failed to build.
 !crates/core/fixtures/**
 
+# Python bytecode from running scripts/boottest.py
+__pycache__/
+
 # Editor / OS local state
 .vscode/
 .idea/
