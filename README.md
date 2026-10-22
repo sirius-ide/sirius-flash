@@ -36,7 +36,9 @@ picks the same default and says nothing.
 - [x] UEFI:NTFS dual-partition layout — the default when a file exceeds FAT32's 4 GB limit,
       with WIM splitting kept as the answer for firmware that will not trust it
 - [x] Image formats — see the table below; detected by content, streamed, never buffered
-- [ ] BIOS boot sectors — our own MBR and FAT32 boot record, not Microsoft's blobs
+- [ ] BIOS boot sectors — our own MBR and FAT32 boot record, not Microsoft's blobs:
+      written and boot-tested under qemu (the real Windows 11 `bootmgr` loads), not yet
+      wired into the flasher
 - [ ] Built-in ISO downloader (Linux catalogue, then Windows)
 - [ ] macOS backend
 - [ ] Windows backend
@@ -70,7 +72,7 @@ proprietary VMware/ThinkPad service-image container with no public
 specification; we would rather say so than pretend.
 
 Every write is hashed with SHA-256 as it goes and read back off the device to
-confirm it — something neither Rufus nor Etcher does.
+confirm it. Rufus writes and returns; it has no read-back at all.
 
 ## Safety first
 

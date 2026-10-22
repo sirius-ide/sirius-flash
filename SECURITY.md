@@ -19,6 +19,10 @@ Sirius Flash version, and what the tool did versus what you expected.
 - **`cargo audit`** runs against the RustSec advisory database on every push
   and pull request, plus weekly — advisories are published after a dependency
   was last touched, so a push-only gate would go stale.
+- **Tauri's own repository advisories are read on every Tauri bump**
+  (`gh api repos/tauri-apps/tauri/security-advisories`). GHSA-w28w-mhc8-qvjv
+  (tauri ≤ 2.11.5, high) was published there and nowhere RustSec or Dependabot
+  looked, so `cargo audit` stayed green through it.
 - **CI runs on Linux, macOS and Windows** with `clippy -D warnings`, the full
   test suite, and a release build.
 
