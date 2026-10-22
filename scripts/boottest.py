@@ -887,6 +887,152 @@ def cmd_selftest(a):
             print("\nthe MBR said so: 'read error'")
         else:
             failed.append("case 15: with no hard disk to fall back to, the MBR did not say 'read error'")
+
+        # Cases 16-20 boot crates/core/boot/fat32.asm, the FAT32 volume boot
+        # record this project will ship, with marker_bootmgr.asm standing in
+        # for BOOTMGR. The stand-in checks what the real one was seen to need
+        # — entered at 2000:0000, DL and BPB byte 0x40 the same hard disk,
+        # bytes-per-sector and hidden sectors intact at 7C00 — and that every
+        # one of its 925 sectors arrived, in order, by numbering them. Case 16
+        # is a tidy volume. Case 17 is a hostile one: the volume label *is*
+        # "BOOTMGR" (root entry 0, attribute 0x08, cluster 0), a deleted
+        # entry, a near-miss name and a long-name part precede the real
+        # file, forty fillers push the
+        # root directory into its third cluster, and the file's 925 clusters
+        # descend from the top of the volume through dozens of FAT sectors.
+        # Case 18 is the same chain in 32 KiB clusters. Case 19 has no
+        # BOOTMGR, which must be said rather than silent. Case 20 plants a
+        # file too big to be BOOTMGR and expects the load to stop short of
+        # the EBDA.
+        print("\n--- the FAT32 VBR: assembling it and the stand-in BOOTMGR ---")
+        fat32_src = os.path.join(here, "..", "crates", "core", "boot", "fat32.asm")
+        fat32 = os.path.join(tmp, "fat32.bin")
+        sh("nasm", "-f", "bin", fat32_src, "-o", fat32)
+        committed = os.path.join(here, "..", "crates", "core", "boot", "fat32.bin")
+        if not os.path.exists(committed):
+            failed.append("fat32: crates/core/boot/fat32.bin is missing; assemble fat32.asm "
+                          "and commit the result beside it")
+        elif open(committed, "rb").read() != open(fat32, "rb").read():
+            failed.append("fat32: crates/core/boot/fat32.bin is not what fat32.asm assembles "
+                          "to; reassemble it (nasm -f bin fat32.asm -o fat32.bin) and commit both")
+        else:
+            print("crates/core/boot/fat32.bin matches the source")
+
+        # The Windows 11 BOOTMGR's size: 924 full sectors and a 276-byte tail,
+        # so the last cluster is partial and the last sector is too.
+        SIZE = 473364
+
+        def stand_in(size, path):
+            """The stand-in BOOTMGR, built for a file of `size` bytes, written to `path`."""
+            full = size // SECTOR
+            stub = os.path.join(tmp, f"marker_bootmgr-{size}.bin")
+            sh("nasm", "-f", "bin", f"-DSECTORS={full}", "-DHIDDEN=2048", f"-DSIZE={size}",
+               os.path.join(here, "boot", "marker_bootmgr.asm"), "-o", stub)
+            payload = bytearray(size)
+            payload[:SECTOR] = open(stub, "rb").read()
+            rnd = random.Random(7)
+            for k in range(1, full + 1):
+                o, end = k * SECTOR, min((k + 1) * SECTOR, size)
+                payload[o:end] = rnd.randbytes(end - o)    # not zeros: a zero-filled load must fail
+                payload[o:o + 4] = struct.pack("<I", k)
+            payload[size - 4:] = b"END!"
+            with open(path, "wb") as f:
+                f.write(payload)
+            return path
+
+        bootmgr = stand_in(SIZE, os.path.join(tmp, "bootmgr.bin"))
+        small = os.path.join(tmp, "small.txt")
+        with open(small, "wb") as f:
+            f.write(b"not it\n")
+        empty = os.path.join(tmp, "empty")
+        open(empty, "wb").close()
+
+        def vbr_case(case, what, spc, size_mib, layout, expect="SIRIUS-BOOTMGR-OK dl=80",
+                     file=None, blank_drive_byte=False):
+            print(f"\n--- case {case}: {what} ---")
+            file = file or bootmgr
+            vimg = os.path.join(tmp, f"vbr-{case}.img")
+            label = "BOOTMGR" if layout == "hostile" else "BOOTTEST"
+            cmd_build(argparse.Namespace(image=vimg, size_mib=size_mib, label=label,
+                                         start=2048, sec_per_clus=spc))
+
+            def put(source, name, **kw):
+                ns = dict(image=vimg, source=source, name=name, start=2048, attr="0x20",
+                          raw_name=None, deleted=False, scatter=False, lfn=None)
+                ns.update(kw)
+                cmd_put(argparse.Namespace(**ns))
+
+            if layout == "hostile":
+                # (Not a *directory* called BOOTMGR beside the file: FAT names
+                # are unique within a directory whatever their type, so that is
+                # a duplicate entry no real volume can hold, and fsck.fat says
+                # so. The volume label is the legal way to plant those 11 bytes
+                # ahead of the file, and mkfs.fat put it in root entry 0.)
+                put(small, "BOOTMGR", deleted=True)             # a deleted BOOTMGR
+                put(small, "BOOTMGR.X")                         # near miss: "BOOTMGR X  "
+                put(small, "BOOTMG~1.OLD", lfn="bootmgr.old")   # a long-name part, then its entry
+                for i in range(40):                             # past the first root cluster
+                    put(small, f"FILL{i:04d}.TXT")
+                put(file, "BOOTMGR", scatter=True, attr="0x27")
+            elif layout == "scattered":
+                put(file, "BOOTMGR", scatter=True, attr="0x27")
+            elif layout == "plain":
+                put(file, "BOOTMGR", attr="0x27")
+            # 0x27 is what Windows gives bootmgr: read-only, hidden, system,
+            # archive. A loader that matched "attribute == 0x20" would pass a
+            # volume our own `put` wrote and fail every real one.
+            cmd_mbr(argparse.Namespace(image=vimg, binary=real_mbr))
+            cmd_vbr(argparse.Namespace(image=vimg, binary=fat32, start=2048))
+            if blank_drive_byte:
+                # mkfs.fat writes 0x80 into BS_DrvNum, and qemu boots as 0x80,
+                # so the VBR's own store of DL there is invisible unless the
+                # field starts out wrong. Both copies of the boot sector.
+                with open(vimg, "r+b") as f:
+                    for lba in (2048, 2048 + read_bpb(vimg, 2048).bk_boot_sec):
+                        f.seek(lba * SECTOR + 0x40)
+                        f.write(b"\0")
+            # Either marker, or a message from the MBR or the VBR, ends the wait.
+            screen = boot_and_read(vimg, expect=("SIRIUS-BOOTMGR-", "Sirius: "), timeout=a.timeout)
+            show(screen)
+            if any(expect in l for l in screen):
+                print(f"\n{expect!r} is on screen")
+            else:
+                failed.append(f"case {case}: {what}, and {expect!r} did not appear")
+            return vimg
+
+        plain = vbr_case(16, "the VBR loads BOOTMGR from a tidy volume", 8, 512, "plain",
+                         blank_drive_byte=True)
+        hostile = vbr_case(17, "the VBR loads BOOTMGR from a hostile volume (1-sector clusters)",
+                           1, 512, "hostile")
+        vbr_case(18, "the VBR loads a scattered BOOTMGR in 32 KiB clusters", 64, 2100, "scattered")
+        vbr_case(19, "no BOOTMGR on the volume", 8, 512, "none", expect="Sirius: BOOTMGR not found")
+
+        # A file far larger than any BOOTMGR: the load stops at linear 0x9F000
+        # rather than running over the EBDA, video memory and, once the
+        # segment wraps at 1 MiB, the interrupt table and the loader itself.
+        # The stand-in then runs and finds its first missing sector, which is
+        # the loud outcome. The file has to be big enough to wrap: writes into
+        # video memory and ROM below 1 MiB simply do not stick, so a 600 KB
+        # file reaches the same verdict with or without the cap; 1.2 MB
+        # without the cap scribbles over 0:0000 and prints nothing.
+        big = stand_in(1_200_000, os.path.join(tmp, "bootmgr-big.bin"))
+        vbr_case(20, "a 1.2 MB BOOTMGR stops loading below the EBDA", 8, 512, "plain",
+                 expect="SIRIUS-BOOTMGR-BAD:S", file=big)
+
+        # The hostile layout was written by `put`, so fsck.fat checks it is a
+        # legal FAT32 volume and not merely one our loader happens to read.
+        if shutil.which("fsck.fat") is None:
+            print("fsck.fat not installed — skipping its check of cases 16 and 17 (skipped, not passing)")
+        else:
+            for case, vimg in ((16, plain), (17, hostile)):
+                part = os.path.join(tmp, f"part-{case}.img")
+                sh("dd", f"if={vimg}", f"of={part}", "bs=512", "skip=2048",
+                   "conv=sparse", "status=none")
+                check = subprocess.run(["fsck.fat", "-n", part], capture_output=True, text=True)
+                print(f"case {case}: {check.stdout.strip().splitlines()[-1]}")
+                if check.returncode != 0 or "differences" in check.stdout:
+                    failed.append(f"case {case}: fsck.fat objects to the volume the stand-in "
+                                  f"booted from:\n{check.stdout}")
     finally:
         if a.keep:
             print(f"\nkept: {tmp}")
@@ -898,8 +1044,9 @@ def cmd_selftest(a):
         for f in failed:
             print(f"  - {f}", file=sys.stderr)
         return 1
-    print("\nSELFTEST PASSED: the harness detects a booting MBR and a dead one, and ours "
-          "chainloads, refuses, hands over correctly, and copes with CHS-only and wrong-DL firmware")
+    print("\nSELFTEST PASSED: the harness detects a booting MBR and a dead one; our MBR "
+          "chainloads, refuses, hands over correctly, and copes with CHS-only and wrong-DL "
+          "firmware; our FAT32 VBR finds and loads BOOTMGR from tidy and hostile volumes")
     return 0
 
 

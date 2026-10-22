@@ -102,7 +102,8 @@ jobs:
   # from one that always passes. Cases 5-15 then boot crates/core/boot/mbr.asm:
   # it must chainload with the handover contract intact, refuse bad media
   # aloud rather than halt in silence, and cope with firmware that lacks INT
-  # 13h extensions or names the wrong drive.
+  # 13h extensions or names the wrong drive. Cases 16-20 boot fat32.asm, which
+  # must find and load BOOTMGR from tidy and hostile FAT32 volumes.
   #
   # Everything runs unprivileged under TCG, so no KVM and no root: this works in
   # a container as well as it does on a laptop.
@@ -115,13 +116,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 nasm dosfstools
-      # crates/core/boot/mbr.bin is the binary core ships (include_bytes!, so
+      # crates/core/boot/*.bin are the binaries core ships (include_bytes!, so
       # the macOS and Windows jobs need no assembler). This diff is what stops
-      # it drifting from the source it claims to be. The selftest checks the
-      # same thing; this step just names the failure plainly.
-      - name: mbr.bin is what mbr.asm assembles to
+      # them drifting from the sources they claim to be. The selftest checks
+      # the same thing; this step just names the failure plainly.
+      - name: mbr.bin and fat32.bin are what their sources assemble to
         run: |
           nasm -f bin crates/core/boot/mbr.asm -o /tmp/mbr.bin
           cmp /tmp/mbr.bin crates/core/boot/mbr.bin
+          nasm -f bin crates/core/boot/fat32.asm -o /tmp/fat32.bin
+          cmp /tmp/fat32.bin crates/core/boot/fat32.bin
       - name: Boot-test harness selftest
         run: ./scripts/boottest.py selftest
