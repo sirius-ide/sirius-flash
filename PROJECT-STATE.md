@@ -658,6 +658,12 @@ hybrid ISOs, and the legacy/packer tail.
   nothing is worse than none. Also untested on a real install: our `autounattend.xml` at the
   media root (Rufus puts it inside `boot.wim` index 2 or under `sources\$OEM$\$$\Panther`,
   and patches the bypass into the offline registry to avoid a command window during Setup).
+- **CI's `gui` job can hang for six hours in `apt-get`.** On the final push of 2026-10-22 its
+  "GUI system dependencies" step hung from 16:06 to 22:07 UTC until GitHub's job limit
+  cancelled the run; a rerun of the job was green in ten minutes, and the commit was
+  docs-only. Nothing in `ci.yml` sets `timeout-minutes`, so a stalled mirror costs six hours
+  and a red run. Cheap fix for the class: `timeout-minutes` on each job (`gui` normally
+  takes ~10 min, `check` ~6, `boot` ~2), and `apt-get -o Acquire::Retries=3`.
 - `RUSTSEC-2024-0429` (`glib`) is accepted and documented in `SECURITY.md`; it arrives via
   Tauri's GTK stack and has no fixed version reachable from here. Still true at tauri 2.12.5.
 - **The Tauri app was invisible to CI, and that had already cost something.** It is
