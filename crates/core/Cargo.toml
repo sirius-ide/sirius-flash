@@ -26,4 +26,8 @@ liblzma = { version = "0.4", features = ["static"] }
 # umbrella "deflate" feature would also pull in zopfli (a *compressor*) and
 # switch flate2 to a different backend, so name the narrow feature instead.
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+# The CRC-32 a zip's central directory records for each member: the one
+# integrity check a zip member has, where every other format verifies itself.
+# Already in the tree through zip.
+crc32fast = "1"
 bzip2 = "0.6"

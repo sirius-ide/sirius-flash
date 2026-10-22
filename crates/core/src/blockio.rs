@@ -507,17 +507,29 @@ impl<R: Read> Read for Counted<R> {
 /// can equally stop short. Neither is detectable from the compressed stream,
 /// and `verify_written` cannot catch either, because the digest is taken over
 /// whatever we actually wrote.
+///
+/// The same index records a CRC-32 of each member, and it is the only integrity
+/// check a zip member has: gzip, xz, bzip2 and zstd all carry a checksum their
+/// decoder verifies at the end of the stream, while a stored member is copied
+/// verbatim and a deflated one has no trailer. Without it a flipped bit, or an
+/// index that understates the size in both fields by the same amount, writes a
+/// wrong image that read-back verification then certifies. The check lands
+/// when the member ends, so the device has been written by then — like a
+/// truncated stream, it turns a false success into a reported failure.
 struct Exact<R> {
     inner: R,
     left: u64,
     total: u64,
+    hasher: crc32fast::Hasher,
+    crc32: u32,
 }
 
 impl<R: Read> Read for Exact<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.left == 0 {
             // Promised length reached: anything still coming means the archive
-            // lied about the size, so stop rather than write it.
+            // lied about the size, so stop rather than write it. Checked before
+            // the CRC, which would also fail here but names the wrong fault.
             let mut probe = [0u8; 1];
             if self.inner.read(&mut probe)? != 0 {
                 return Err(std::io::Error::new(
@@ -526,6 +538,17 @@ impl<R: Read> Read for Exact<R> {
                         "this member expands past the {} bytes its index promised \
                          — the archive is corrupt or deliberately misdeclared",
                         self.total
+                    ),
+                ));
+            }
+            let got = self.hasher.clone().finalize();
+            if got != self.crc32 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "this member's CRC-32 is {got:08x} but its index says {:08x} \
+                         — the archive is corrupt",
+                        self.crc32
                     ),
                 ));
             }
@@ -543,6 +566,7 @@ impl<R: Read> Read for Exact<R> {
                 ),
             ));
         }
+        self.hasher.update(&buf[..n]);
         self.left -= n as u64;
         Ok(n)
     }
@@ -658,6 +682,9 @@ struct ZipMember {
     uncompressed_size: u64,
     /// Checked because the raw scan below does not decrypt.
     encrypted: bool,
+    /// What the central directory says the member's bytes hash to. The one
+    /// integrity check a zip member has (see `Exact`).
+    crc32: u32,
     name: String,
 }
 
@@ -682,13 +709,16 @@ const MAX_ZIP_ENTRIES: usize = 100_000;
 /// deliberate divergence, not an oversight: on an archive whose image sits
 /// second, the first-member rule writes the README.)
 ///
-/// The scan uses `by_index_raw`, which reads the central directory without
-/// building a decoder for each entry. `by_index` would construct a real
-/// decryptor and decompressor per entry, so a single sibling the crate cannot
-/// handle — one encrypted note, one bzip2-compressed README — aborts the whole
-/// archive even though the image beside it is perfectly writable. The cost is
-/// that `by_index_raw` will happily stream ciphertext, so the chosen member is
-/// checked for encryption explicitly below.
+/// The ranking reads only the central directory (`by_index_data`): no local
+/// header is parsed, no decoder built. That is what lets a sibling the crate
+/// cannot handle — an encrypted note, a bzip2-compressed README, a member
+/// whose own header is damaged — sit beside a perfectly writable image without
+/// vetoing it, which is the verdict `unzip -t` gives such an archive. Only the
+/// winner's local header is then located (`by_index_raw`), and if *that* is
+/// damaged the archive is refused: the previous version skipped any member it
+/// could not locate and so answered a damaged image with the next-largest
+/// file, writing the notes beside it to the device as the image. `by_index_raw`
+/// does not decrypt, so the winner is checked for encryption explicitly below.
 ///
 /// Only the central directory is read here; the archive is dropped before any
 /// payload streams, which is what lets the returned reader be owned rather than
@@ -742,61 +772,62 @@ fn pick_zip_member<R: Read + Seek>(
         );
     }
 
-    let mut best: Option<(u64, ZipMember)> = None;
-    let mut unreadable = 0usize;
+    // A name the way the crate decodes it (UTF-8, else CP437; the API says
+    // that can fail, though every byte string is CP437). It only labels error
+    // messages here, so one that will not decode is shown lossily.
+    fn name_of(name: zip::result::ZipResult<std::borrow::Cow<'_, str>>, raw: &[u8]) -> String {
+        name.map(|n| n.into_owned())
+            .unwrap_or_else(|_| String::from_utf8_lossy(raw).into_owned())
+    }
+
+    let mut best: Option<(usize, u64)> = None;
     for i in 0..archive.len() {
-        // Deliberately not `?`. Locating an entry parses its local header, so a
-        // single damaged sibling would otherwise veto an archive whose image is
-        // perfectly intact — `unzip -t` reports exactly that split verdict.
-        let Ok(entry) = archive.by_index_raw(i) else {
-            unreadable += 1;
+        // Central directory only: nothing here touches the member's own header.
+        let Ok(entry) = archive.by_index_data(i) else {
             continue;
         };
         if entry.is_dir() {
             continue;
         }
-        let size = entry.size();
-        if best
-            .as_ref()
-            .is_some_and(|(best_size, _)| size <= *best_size)
-        {
-            continue;
+        if best.is_none_or(|(_, size)| entry.size() > size) {
+            best = Some((i, entry.size()));
         }
-        let Some(data_start) = entry.data_start() else {
-            unreadable += 1;
-            continue;
-        };
-        best = Some((
-            size,
-            ZipMember {
-                data_start,
-                compressed_size: entry.compressed_size(),
-                uncompressed_size: size,
-                method: entry.compression(),
-                encrypted: entry.encrypted(),
-                // zip 9 decodes the name lazily (UTF-8, else CP437) and the
-                // API says that can fail, though every byte string is CP437.
-                // The name only labels error messages here, so one that will
-                // not decode is shown lossily rather than vetoing the member.
-                name: entry
-                    .name()
-                    .map(|n| n.into_owned())
-                    .unwrap_or_else(|_| String::from_utf8_lossy(entry.name_raw()).into_owned()),
-            },
-        ));
     }
-
-    let Some((size, member)) = best else {
-        if unreadable > 0 {
-            bail!(
-                "{} has {unreadable} damaged entries and no readable file among them",
-                path.display()
-            );
-        }
+    let Some((index, size)) = best else {
         bail!(
             "{} holds only directories — there is no image inside it to write",
             path.display()
         );
+    };
+
+    let listed = archive.by_index_data(index)?;
+    let name = name_of(listed.name(), listed.name_raw());
+    let (compressed_size, method, encrypted, crc32) = (
+        listed.compressed_size(),
+        listed.compression(),
+        listed.encrypted(),
+        listed.crc32(),
+    );
+    // Now the member's own header, for where its bytes begin. This is the one
+    // member whose damage is the image's damage.
+    let data_start = archive
+        .by_index_raw(index)
+        .ok()
+        .and_then(|entry| entry.data_start())
+        .with_context(|| {
+            format!(
+                "{name} in {} has a damaged header — the archive is corrupt",
+                path.display()
+            )
+        })?;
+    let member = ZipMember {
+        data_start,
+        compressed_size,
+        method,
+        uncompressed_size: size,
+        encrypted,
+        crc32,
+        name,
     };
 
     // `by_index_raw` does not decrypt, and would hand us ciphertext to write to
@@ -875,6 +906,7 @@ pub fn open_image(path: &Path) -> Result<(Box<dyn Read>, u64, Compression, ByteC
     // than the whole archive, which is what makes it finish at 100%.
     let mut zip_method = zip::CompressionMethod::Stored;
     let mut zip_uncompressed = 0u64;
+    let mut zip_crc32 = 0u32;
     let source = if compression == Compression::VhdFixed {
         // A fixed VHD is a raw disk image with a 512-byte footer bolted on the
         // end. Writing the footer to the device would append 512 bytes of
@@ -894,6 +926,7 @@ pub fn open_image(path: &Path) -> Result<(Box<dyn Read>, u64, Compression, ByteC
         size = member.compressed_size;
         zip_method = member.method;
         zip_uncompressed = member.uncompressed_size;
+        zip_crc32 = member.crc32;
         // `take` is a bound, not a convenience: without it a member whose length
         // is understated would keep reading into the next member and the central
         // directory.
@@ -919,6 +952,8 @@ pub fn open_image(path: &Path) -> Result<(Box<dyn Read>, u64, Compression, ByteC
                 inner: decoded,
                 left: zip_uncompressed,
                 total: zip_uncompressed,
+                hasher: crc32fast::Hasher::new(),
+                crc32: zip_crc32,
             })
         }
         Compression::None => Box::new(counted),
@@ -1857,6 +1892,91 @@ mod tests {
         file.seek(SeekFrom::Start(member.data_start)).unwrap();
         file.read_exact(&mut got).unwrap();
         assert_eq!(got, PAYLOAD);
+    }
+
+    /// Offsets of the parts of the `ZIP` fixture a test wants to damage: the
+    /// local header and the data of `1-image.img`, and its central-directory
+    /// entry. Found by the name rather than hard-coded, so a re-made fixture
+    /// cannot leave a test quietly patching the wrong bytes.
+    fn zip_fixture_image_offsets() -> (usize, usize, usize) {
+        let name = b"1-image.img";
+        let find = |from: usize| {
+            ZIP[from..]
+                .windows(name.len())
+                .position(|w| w == name)
+                .map(|i| i + from)
+                .unwrap()
+        };
+        let local_name = find(0);
+        let local_header = local_name - 30;
+        let data = local_name + name.len();
+        let cd_entry = find(local_name + 1) - 46;
+        assert_eq!(&ZIP[local_header..local_header + 4], b"PK\x03\x04");
+        assert_eq!(&ZIP[cd_entry..cd_entry + 4], b"PK\x01\x02");
+        assert_eq!(&ZIP[data..data + PAYLOAD.len()], PAYLOAD);
+        (local_header, data, cd_entry)
+    }
+
+    /// Nothing else checks a zip member's bytes. gzip, xz, bzip2 and zstd all
+    /// carry a checksum their decoder verifies at the end of the stream; a
+    /// stored zip member is copied verbatim and a deflated one has no trailer.
+    /// The CRC-32 the central directory records for each member is the one
+    /// check available, and without it a flipped bit writes a corrupt image
+    /// that read-back verification then certifies, since the digest is taken
+    /// over what was written.
+    #[test]
+    fn a_corrupt_zip_member_is_refused_by_its_crc() {
+        let (_, data, _) = zip_fixture_image_offsets();
+        let mut bad = ZIP.to_vec();
+        bad[data + 7] ^= 0x01;
+        let src = tmp("zip-crc-src");
+        let dst = tmp("zip-crc-dst");
+        std::fs::write(&src, &bad).unwrap();
+        std::fs::write(&dst, b"").unwrap();
+        let err = write_image(&src, &dst, &mut noop).unwrap_err();
+        assert!(format!("{err:#}").contains("CRC-32"), "got: {err:#}");
+    }
+
+    /// A stored member whose index understates its size by the same amount in
+    /// both fields passes every size check — the two agree, and `Exact` is
+    /// satisfied — and used to write a short image and report success. The CRC
+    /// is over the whole member, so it does not agree.
+    #[test]
+    fn a_zip_member_declared_shorter_than_it_is_is_refused() {
+        let (_, _, cd) = zip_fixture_image_offsets();
+        let mut bad = ZIP.to_vec();
+        let short = (PAYLOAD.len() as u32 - 8).to_le_bytes();
+        bad[cd + 20..cd + 24].copy_from_slice(&short); // compressed size
+        bad[cd + 24..cd + 28].copy_from_slice(&short); // uncompressed size
+        let src = tmp("zip-short-src");
+        let dst = tmp("zip-short-dst");
+        std::fs::write(&src, &bad).unwrap();
+        std::fs::write(&dst, b"").unwrap();
+        let err = write_image(&src, &dst, &mut noop).unwrap_err();
+        assert!(format!("{err:#}").contains("CRC-32"), "got: {err:#}");
+    }
+
+    /// Tolerating a damaged *sibling* must not extend to the image itself.
+    /// With the image's local header unreadable, the previous selection moved
+    /// on to the next-largest member — and wrote the five-byte notes file to
+    /// the device as the image, verified it, and reported success.
+    #[test]
+    fn a_zip_whose_image_header_is_damaged_is_refused_not_replaced_by_a_sibling() {
+        let (local_header, _, _) = zip_fixture_image_offsets();
+        let mut bad = ZIP.to_vec();
+        bad[local_header..local_header + 4].copy_from_slice(b"XXXX");
+        let src = tmp("zip-damaged-image-src");
+        let dst = tmp("zip-damaged-image-dst");
+        std::fs::write(&src, &bad).unwrap();
+        std::fs::write(&dst, b"").unwrap();
+        assert_eq!(detect_compression(&src).unwrap(), Compression::Zip);
+        let err = write_image(&src, &dst, &mut noop).unwrap_err();
+        assert!(format!("{err:#}").contains("1-image.img"), "got: {err:#}");
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            b"",
+            "nothing may have been written"
+        );
     }
 
     #[test]
