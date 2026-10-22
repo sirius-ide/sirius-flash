@@ -15,7 +15,7 @@ commits before anyone noticed.
 Branch **`main`**. The units below were each committed separately, in this order: the
 dependency bump (`80c0155`), zip integrity (`8d34a85`), the MBR (`f2e3fe6`), the FAT32
 VBR (`241f6b5`), the Tauri 2.12 set (`5f17de3`), four rebased Dependabot merges, the
-app's sha2 alignment (`7f4d15f`), this checkpoint. Cloud sessions work on a branch
+app's sha2 alignment (`3f17aea`), this checkpoint. Cloud sessions work on a branch
 (`CLAUDE.md`).
 
 - **Verified, not just written:**
@@ -630,7 +630,7 @@ hybrid ISOs, and the legacy/packer tail.
     `f38b30f`), **#5** (clap 4.6.7, `4ab2396`), **#9** (actions/setup-node 4→7, `623777c`)
     and **#10** (pnpm/action-setup 4→6, `6544a77`; both majors were read: the workflow pins
     `node-version: 22` and `version: 10`). The app's lockfile was then aligned to sha2
-    0.11.1 by hand (`7f4d15f`), because Dependabot bumps the two lockfiles separately and
+    0.11.1 by hand (`3f17aea`), because Dependabot bumps the two lockfiles separately and
     `cargo audit --file` reads only what the app's lists.
   - **#20** (serde_json in `app/src-tauri`) lost a base-branch race during the merges;
     Dependabot re-opened it as **#29**, which merged once its checks passed (`e9b858d`).
