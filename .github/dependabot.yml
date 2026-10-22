@@ -13,6 +13,14 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # `tauri build` refuses a crate whose npm counterpart differs in
+    # major.minor (tauri <-> @tauri-apps/api, and each plugin pair), and CI's
+    # gui job never runs `tauri build`, so a lone bump of one side stays green
+    # and breaks the real build. Grouping cannot cross ecosystems, but one PR
+    # per side is two PRs to land together instead of seven to untangle.
+    groups:
+      tauri:
+        patterns: ["tauri", "tauri-build", "tauri-plugin-*"]
     ignore:
       # glib 0.18 is pinned transitively by gtk 0.18 <- tauri 2.x, so no
       # standalone bump can succeed; Dependabot retried and failed on every
@@ -25,6 +33,9 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      tauri:
+        patterns: ["@tauri-apps/*"]
 
   - package-ecosystem: github-actions
     directory: "/"
