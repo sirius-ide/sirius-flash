@@ -24,8 +24,8 @@ const TICK: Duration = Duration::from_millis(250);
 
 /// Largest zstd window we will decode.
 ///
-/// ruzstd defaults to a 100 MB cap and, since 0.9, applies it to the *first*
-/// frame as well as later ones — which rejects images written with
+/// ruzstd's default cap (100 MB in 0.9.0, 128 MiB since 0.9.1) is, since 0.9,
+/// applied to the *first* frame as well as later ones — which rejects images written with
 /// `zstd --long` (windowLog 27 is already 128 MiB). 4 GiB covers everything
 /// the reference encoder emits. The window buffer grows on demand, so a larger
 /// ceiling costs nothing until a frame actually needs it, and anything past it
@@ -693,9 +693,40 @@ const MAX_ZIP_ENTRIES: usize = 100_000;
 /// Only the central directory is read here; the archive is dropped before any
 /// payload streams, which is what lets the returned reader be owned rather than
 /// borrowed from it.
-fn locate_zip_member(file: &mut File, path: &Path, file_len: u64) -> Result<ZipMember> {
+fn locate_zip_member<R: Read + Seek>(
+    file: &mut R,
+    path: &Path,
+    file_len: u64,
+) -> Result<ZipMember> {
+    // Opened with the archive's offset in the file declared, not detected.
+    // Since 9.0, left to detect it, the crate finds the central directory by
+    // scanning *forwards from byte 0* for its signature: the whole file is
+    // read, in 1 KiB steps, before a single member is listed — about two
+    // seconds and four million syscalls for a 2 GiB archive on a warm cache,
+    // against microseconds on 8.x, and from a cold USB stick minutes, all
+    // before the first write. Nothing that reaches here has anything in front
+    // of the archive (`sniff` wants the local-header signature at byte 0, and
+    // SFX stubs are refused), so the offset is 0, and told so the crate checks
+    // one position and stops. If that check fails the archive is unusual rather
+    // than necessarily unreadable — a writer whose offsets are off — so the
+    // scanning open gets the final say, exactly as it had before.
+    let known = zip::read::Config {
+        archive_offset: zip::read::ArchiveOffset::Known(0),
+    };
+    if let Ok(mut archive) = zip::ZipArchive::with_config(known, &mut *file) {
+        return pick_zip_member(&mut archive, path, file_len);
+    }
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| anyhow::anyhow!("not a readable zip image: {e}"))?;
+    pick_zip_member(&mut archive, path, file_len)
+}
+
+/// The selection itself, over an archive however it was opened.
+fn pick_zip_member<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    path: &Path,
+    file_len: u64,
+) -> Result<ZipMember> {
     if archive.is_empty() {
         bail!(
             "{} is an empty zip — there is no image inside it to write",
@@ -743,7 +774,14 @@ fn locate_zip_member(file: &mut File, path: &Path, file_len: u64) -> Result<ZipM
                 uncompressed_size: size,
                 method: entry.compression(),
                 encrypted: entry.encrypted(),
-                name: entry.name().to_string(),
+                // zip 9 decodes the name lazily (UTF-8, else CP437) and the
+                // API says that can fail, though every byte string is CP437.
+                // The name only labels error messages here, so one that will
+                // not decode is shown lossily rather than vetoing the member.
+                name: entry
+                    .name()
+                    .map(|n| n.into_owned())
+                    .unwrap_or_else(|_| String::from_utf8_lossy(entry.name_raw()).into_owned()),
             },
         ));
     }
@@ -1455,8 +1493,8 @@ mod tests {
         0x86, 0x8c, 0x19, 0x34, 0x6a, 0xd8, 0xb8, 0x81, 0x23, 0x07,
     ];
 
-    /// `zstd --long=27` of PAYLOAD: a 128 MiB window, well past the 100 MB
-    /// default cap ruzstd began applying to the first frame in 0.9.
+    /// `zstd --long=27` of PAYLOAD: a 128 MiB window, past the default cap
+    /// (100 MB at the time) ruzstd began applying to the first frame in 0.9.
     const ZST_LONG_WINDOW: &[u8] = &[
         0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x88, 0x81, 0x01, 0x00, 0x53, 0x49, 0x52, 0x49, 0x55, 0x53,
         0x2d, 0x46, 0x4c, 0x41, 0x53, 0x48, 0x2d, 0x43, 0x4f, 0x4d, 0x50, 0x52, 0x45, 0x53, 0x53,
@@ -1733,6 +1771,94 @@ mod tests {
         );
     }
 
+    /// Bytes read through a reader, so a test can see what opening an archive
+    /// cost.
+    struct Metered<R> {
+        inner: R,
+        read: u64,
+    }
+
+    impl<R: Read> Read for Metered<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl<R: Seek> Seek for Metered<R> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// Unless told where the archive starts, zip 9 finds the central directory
+    /// by scanning the file forwards from byte 0 — which reads a 2 GiB archive
+    /// end to end before the first member is listed, and from a cold USB stick
+    /// that is minutes, all before the first write. We tell it. The archive is
+    /// built with the crate's own writer because a multi-megabyte fixture does
+    /// not belong in the repo; the member is decoded and compared afterwards,
+    /// so a writer quirk could not pass unnoticed.
+    #[test]
+    fn locating_the_member_does_not_read_the_whole_archive() {
+        let src = tmp("zip-big-src");
+        let payload: Vec<u8> = (0..4u32 * 1024 * 1024)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        {
+            let mut w = zip::ZipWriter::new(File::create(&src).unwrap());
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.start_file("README.txt", stored).unwrap();
+            w.write_all(b"an image archive").unwrap();
+            w.start_file("image.img", stored).unwrap();
+            w.write_all(&payload).unwrap();
+            w.finish().unwrap();
+        }
+        let len = std::fs::metadata(&src).unwrap().len();
+        assert!(len > payload.len() as u64);
+
+        let mut metered = Metered {
+            inner: File::open(&src).unwrap(),
+            read: 0,
+        };
+        let member = locate_zip_member(&mut metered, &src, len).unwrap();
+        assert_eq!(member.name, "image.img");
+        assert_eq!(member.uncompressed_size, payload.len() as u64);
+        assert!(
+            metered.read < 64 * 1024,
+            "locating the member read {} of the archive's {len} bytes",
+            metered.read
+        );
+
+        let dst = tmp("zip-big-dst");
+        std::fs::write(&dst, b"").unwrap();
+        let o = write_image(&src, &dst, &mut noop).unwrap();
+        assert_eq!(o.bytes_written, payload.len() as u64);
+        assert_eq!(std::fs::read(&dst).unwrap(), payload);
+    }
+
+    /// An archive the fast open cannot place — here, with bytes in front of it,
+    /// where a self-extracting stub would sit — still opens by the scanning
+    /// route, so nothing that opened before opens no longer. (`sniff` refuses
+    /// such a file before it gets here; this calls the locator directly.)
+    #[test]
+    fn a_zip_the_fast_open_cannot_place_still_opens() {
+        let src = tmp("zip-shifted-src");
+        let mut shifted = vec![0xEEu8; 777];
+        shifted.extend_from_slice(ZIP);
+        std::fs::write(&src, &shifted).unwrap();
+        let mut file = File::open(&src).unwrap();
+        let member = locate_zip_member(&mut file, &src, shifted.len() as u64).unwrap();
+        assert_eq!(member.name, "1-image.img");
+        // Second local header at archive offset 0x29; 30-byte header, 11-byte name.
+        assert_eq!(member.data_start, 777 + 0x29 + 30 + 11);
+        let mut got = vec![0u8; PAYLOAD.len()];
+        file.seek(SeekFrom::Start(member.data_start)).unwrap();
+        file.read_exact(&mut got).unwrap();
+        assert_eq!(got, PAYLOAD);
+    }
+
     #[test]
     fn an_empty_zip_is_rejected_rather_than_written_raw() {
         // "PK\x05\x06" — a zip with no members at all. Writing the archive
@@ -1750,8 +1876,8 @@ mod tests {
         assert!(err.to_string().contains("empty zip"), "got: {err}");
     }
 
-    /// ruzstd 0.9 began applying its 100 MB default window cap to the first
-    /// frame as well as later ones, which would refuse every image written
+    /// ruzstd 0.9 began applying its default window cap (then 100 MB, 128 MiB
+    /// since 0.9.1) to the first frame as well as later ones, which would refuse every image written
     /// with `zstd --long`. We raise the cap rather than inherit that.
     #[test]
     fn a_large_zstd_window_is_still_accepted() {
