@@ -35,8 +35,12 @@ unformatted tree hides every later failure. Linux-only imports must be `cfg`-gat
 `clippy -D warnings` fails the other two platforms on unused imports.
 
 If `scripts/boottest.py`, `scripts/boot/` or `crates/core/boot/` changed, also run
-`./scripts/boottest.py selftest` (needs `qemu-system-x86_64`, `nasm`, `mkfs.fat`). CI's
-`boot` job runs it too, but a broken boot sector is cheaper to see in eight seconds here.
+`./scripts/boottest.py selftest` (needs `qemu-system-x86_64`, `nasm`, `mkfs.fat`,
+`sfdisk`, `fsck.fat`; ~55 s for 20 cases). CI's `boot` job runs it too, but a broken boot
+sector is cheaper to see here. A changed `.asm` under `crates/core/boot/` needs its `.bin`
+reassembled and committed beside it (`nasm -f bin x.asm -o x.bin`, default optimisation):
+the selftest and CI both diff the two and fail on drift. A new selftest case is not done
+until it has been seen to fail on a *copy* of the tree with one bug put in.
 
 ## Commits
 
@@ -66,4 +70,14 @@ conversation itself doesn't carry over.
 ## Working preferences
 
 - Subagents (Agent tool): pass `model: "sonnet"` for research, search and exploration;
-  keep the main model for deep reasoning only.
+  keep the main model for deep reasoning, the assembly, design calls and final judgement.
+  Fan out freely and in parallel; brief each one with exact paths and the question; an
+  adversarial review of each finished unit has found more than the unit's own tests every
+  time. After a fan-out, check `git status` for files an agent left in the repo, and
+  commit by explicit path, never `git add -A`.
+- Commits: propose one Conventional Commit subject per unit and wait for it to be pasted
+  back. If the reply is only "continue", ask once (commit all / commit but leave GitHub
+  actions / not yet) rather than guessing.
+- The session scratchpad can vanish mid-session. Anything a later session may need goes
+  in the repo (`docs/research/` for research notes) or is re-derivable from the commit
+  message.

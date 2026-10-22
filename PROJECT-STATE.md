@@ -14,9 +14,9 @@ commits before anyone noticed.
 
 Branch **`main`**. The units below were each committed separately, in this order: the
 dependency bump (`80c0155`), zip integrity (`8d34a85`), the MBR (`f2e3fe6`), the FAT32
-VBR (`241f6b5`), the Tauri 2.12 set (`5f17de3`), four rebased Dependabot merges, the
-app's sha2 alignment (`3f17aea`), this checkpoint. Cloud sessions work on a branch
-(`CLAUDE.md`).
+VBR (`241f6b5`), the Tauri 2.12 set (`5f17de3`), five rebased Dependabot merges, the
+app's sha2 alignment (`3f17aea`), this checkpoint. CI and Security were green on every
+push. Cloud sessions work on a branch (`CLAUDE.md`).
 
 - **Verified, not just written:**
   - **`Security` is green**: `zip 9.0.5`, `ruzstd 0.9.1`, both lockfiles audited clean. zip 9
