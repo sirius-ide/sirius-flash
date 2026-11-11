@@ -1181,7 +1181,7 @@ pub fn verify_written(
     len: u64,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<()> {
-    drop_cache(dest);
+    drop_cache(dest)?;
     let src =
         File::open(dest).with_context(|| format!("reopening {} to verify", dest.display()))?;
     let actual = stream(src.take(len), len, Stage::Verify, on_progress, None, |_| {
@@ -1198,17 +1198,42 @@ pub fn verify_written(
     Ok(())
 }
 
-/// Ask the kernel to forget its cached view of a block device.
+/// Ask the kernel to forget its cached view of a block device, so the next read
+/// comes from the medium.
+///
+/// A failure is an error, not a shrug: a read-back after a cache drop that did
+/// not happen checks RAM, and passes for a stick that never took the data. A
+/// regular file has no device cache between us and its medium, so it is left
+/// alone — which is also what the tests write to.
 #[cfg(target_os = "linux")]
-fn drop_cache(dest: &Path) {
-    let _ = std::process::Command::new("blockdev")
+pub(crate) fn drop_cache(dest: &Path) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let is_block = std::fs::metadata(dest)
+        .with_context(|| format!("reading {}", dest.display()))?
+        .file_type()
+        .is_block_device();
+    if !is_block {
+        return Ok(());
+    }
+    let status = std::process::Command::new("blockdev")
         .arg("--flushbufs")
         .arg(dest)
-        .status();
+        .status()
+        .context("running `blockdev --flushbufs`")?;
+    if !status.success() {
+        bail!(
+            "`blockdev --flushbufs {}` exited with {status}, so reading it back would check the \
+             page cache rather than the drive",
+            dest.display()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn drop_cache(_dest: &Path) {}
+pub(crate) fn drop_cache(_dest: &Path) -> Result<()> {
+    Ok(())
+}
 
 /// Does `rel` name exactly this excluded path? Compared case-insensitively,
 /// because ISO9660 and UDF disagree about the case of the same filename.
