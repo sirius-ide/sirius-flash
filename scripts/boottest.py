@@ -19,10 +19,12 @@ results are greppable strings rather than screenshots.
     ./scripts/boottest.py selftest          # proves the harness detects both outcomes,
                                             # then boots crates/core/boot/mbr.asm
 
-Requires: sfdisk, mkfs.fat, qemu-system-x86_64, nasm (selftest only), python3.
+Requires: sfdisk, mkfs.fat, qemu-system-x86_64, python3; the selftest also needs
+nasm, and cargo to build the Rust installer core ships (`install` needs it too).
 """
 
 import argparse
+import json
 import os
 import random
 import shutil
@@ -32,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 
 SECTOR = 512
 TOOLS = ["sfdisk", "mkfs.fat", "qemu-system-x86_64"]
@@ -111,7 +114,7 @@ class Bpb:
             sys.exit("this is FAT12/16, not FAT32 (BPB_FATSz16 is non-zero)")
         # What separates FAT32 from FAT16 is the cluster count, not the BPB
         # fields, and `mkfs.fat -F 32` will build a volume below the floor
-        # without complaining — only `fsck.fat` mentions it afterwards. Media
+        # with nothing but a warning and exit status 0 (dosfstools 4.2). Media
         # that no Windows tool considers valid FAT32 is a bad place to start
         # debugging a boot sector, so refuse it here.
         if self.clusters < 65525:
@@ -258,6 +261,33 @@ def cmd_vbr(a):
             f.seek(lba * SECTOR)
             f.write(merged)
     print(f"installed VBR at LBA {', '.join(map(str, targets))}, BPB preserved")
+
+
+def rust_installer():
+    """Build the installer core ships and return the path of its binary.
+
+    The example wraps `bootcode::install_on_image`, which is the flasher's own
+    check-then-write sequence pointed at a file. Cargo is asked where it put the
+    binary rather than told, so a CARGO_TARGET_DIR cannot send this to a stale
+    one.
+    """
+    manifest = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Cargo.toml")
+    out = sh("cargo", "build", "--quiet", "--manifest-path", manifest, "-p", "sirius-flash-core",
+             "--example", "install_bios_boot", "--message-format=json")
+    for line in out.splitlines():
+        msg = json.loads(line)
+        if (msg.get("reason") == "compiler-artifact"
+                and msg.get("target", {}).get("name") == "install_bios_boot"
+                and msg.get("executable")):
+            return msg["executable"]
+    sys.exit("cargo built nothing called install_bios_boot")
+
+
+def cmd_install(a):
+    # Only cargo: installing needs neither qemu nor the formatters.
+    if shutil.which("cargo") is None:
+        sys.exit("missing required tool: cargo")
+    print(sh(rust_installer(), a.image).strip())
 
 
 # --------------------------------------------------------------------------- #
@@ -434,7 +464,26 @@ def decode_vga(raw):
     return out
 
 
-def boot_and_read(image, expect=None, timeout=25, settle=0.0, floppy=False):
+def ppm_to_png(src, dst):
+    """qemu's screendump writes binary PPM; write it as PNG, with no imaging library."""
+    data = open(src, "rb").read()
+    magic, dims, depth, pixels = data.split(b"\n", 3)
+    if magic != b"P6" or depth != b"255":
+        sys.exit(f"{src}: not an 8-bit binary PPM")
+    w, h = map(int, dims.split())
+    rows = b"".join(b"\0" + pixels[y * w * 3:(y + 1) * w * 3] for y in range(h))
+
+    def chunk(kind, body):
+        return (struct.pack(">I", len(body)) + kind + body
+                + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF))
+
+    with open(dst, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+def boot_and_read(image, expect=None, timeout=25, settle=0.0, floppy=False,
+                  kvm=False, memory=64, screendump=None):
     """Boot the image and return the screen as 25 lines of text.
 
     Stops as soon as `expect` appears, so a passing run costs a second or two
@@ -450,6 +499,11 @@ def boot_and_read(image, expect=None, timeout=25, settle=0.0, floppy=False):
     `floppy` attaches the image as drive A and nothing as a hard disk, so the
     BIOS hands the boot sector DL=0x00 and there is no drive 0x80 to fall back
     to. It exists for the one MBR path that needs exactly that machine.
+
+    `kvm`, `memory` (MiB) and `screendump` (a .png path, taken when the run
+    ends) are for booting real installer media past the boot sectors: Windows
+    PE needs gigabytes of RAM, takes minutes to load its RAM disk under TCG,
+    and draws in a graphics mode the text-buffer read cannot see.
     """
     need_tools()
     # One string, or several: any of them ends the wait. A case that can end in
@@ -468,7 +522,9 @@ def boot_and_read(image, expect=None, timeout=25, settle=0.0, floppy=False):
         # that never appears.
         sock, dump = os.path.join(tmp, "mon"), "vga.bin"
         qemu = subprocess.Popen(
-            ["qemu-system-x86_64", "-machine", "pc", "-accel", "tcg", "-m", "64",
+            ["qemu-system-x86_64", "-machine", "pc",
+             *(["-accel", "kvm", "-cpu", "host"] if kvm else ["-accel", "tcg"]),
+             "-m", str(memory),
              *(["-fda", os.path.abspath(image), "-boot", "a"] if floppy else
                ["-drive", f"file={os.path.abspath(image)},format=raw,if=ide"]),
              "-display", "none", "-vga", "std",
@@ -508,6 +564,15 @@ def boot_and_read(image, expect=None, timeout=25, settle=0.0, floppy=False):
                     if settle <= 0:
                         break
                     deadline, expect, settle = time.time() + settle, None, 0
+            if screendump:
+                mon.sendall(b"screendump shot.ppm\n")
+                shot = os.path.join(tmp, "shot.ppm")
+                for _ in range(40):                 # written asynchronously
+                    time.sleep(0.25)
+                    if os.path.exists(shot) and os.path.getsize(shot) > 15:
+                        break
+                time.sleep(0.5)
+                ppm_to_png(shot, screendump)
             try:
                 mon.sendall(b"quit\n")
             except OSError:
@@ -529,7 +594,9 @@ def show(screen):
 
 
 def cmd_run(a):
-    screen = boot_and_read(a.image, a.expect, a.timeout, a.settle)
+    screen = boot_and_read(a.image, a.expect, a.timeout, a.settle, kvm=a.kvm,
+                           memory=a.memory,
+                           screendump=os.path.abspath(a.screendump) if a.screendump else None)
     if not screen:
         print("no VGA dump — qemu produced nothing readable", file=sys.stderr)
         return 1
@@ -554,7 +621,7 @@ def cmd_selftest(a):
     that always passes, so this checks a known-good boot sector is detected AND
     that media with no boot code is detected as the failure it is.
     """
-    need_tools(["nasm"])
+    need_tools(["nasm", "cargo"])
     here = os.path.dirname(os.path.abspath(__file__))
     tmp = tempfile.mkdtemp(prefix="boottest-")
     img = os.path.join(tmp, "disk.img")
@@ -924,7 +991,19 @@ def cmd_selftest(a):
 
         def stand_in(size, path):
             """The stand-in BOOTMGR, built for a file of `size` bytes, written to `path`."""
-            full = size // SECTOR
+            # The sectors after the first that hold any of the file. Not
+            # size // SECTOR: a size that is an exact multiple of 512 has no
+            # partial last sector, and counting one numbered a sector past the
+            # end -- which also grew the file by the four bytes of its number.
+            full = (size - 1) // SECTOR
+            # The last sector carries its four-byte number and the file ends
+            # with the four bytes "END!", so it needs room for both. With less,
+            # the stand-in reports that sector bad whether or not it loaded:
+            # a case built on such a size passes for any loader.
+            tail = size - full * SECTOR
+            if full and tail < 8:
+                sys.exit(f"stand_in: a {size}-byte file ends with a {tail}-byte sector, which "
+                         f"cannot hold its number and the tail; it could not tell loaded from not")
             stub = os.path.join(tmp, f"marker_bootmgr-{size}.bin")
             sh("nasm", "-f", "bin", f"-DSECTORS={full}", "-DHIDDEN=2048", f"-DSIZE={size}",
                os.path.join(here, "boot", "marker_bootmgr.asm"), "-o", stub)
@@ -1019,12 +1098,125 @@ def cmd_selftest(a):
         vbr_case(20, "a 1.2 MB BOOTMGR stops loading below the EBDA", 8, 512, "plain",
                  expect="SIRIUS-BOOTMGR-BAD:S", file=big)
 
+        # Cases 21-23 run the installer core ships -- bootcode.rs, through the
+        # install_bios_boot example -- rather than this harness's own `mbr` and
+        # `vbr`. The Rust installer is a port of the Python one, field for field,
+        # so the two must produce the same bytes on the same volume (one
+        # geometry here: 512 MiB, 8 sectors per cluster), or one has drifted;
+        # the Rust one must refuse a volume whose hidden-sectors field is off
+        # without writing a byte; and what it writes must boot and pass fsck.fat.
+        print("\n--- case 21: the Rust installer agrees with this harness's, refuses, and boots ---")
+        installer = rust_installer()
+        py_img, rs_img = os.path.join(tmp, "by-python.img"), os.path.join(tmp, "by-rust.img")
+        cmd_build(argparse.Namespace(image=py_img, size_mib=512, label="BOOTTEST",
+                                     start=2048, sec_per_clus=8))
+        cmd_put(argparse.Namespace(image=py_img, source=bootmgr, name="BOOTMGR", start=2048,
+                                   attr="0x27", raw_name=None, deleted=False, scatter=False,
+                                   lfn=None))
+        sh("cp", "--sparse=always", py_img, rs_img)
+
+        with open(rs_img, "r+b") as f:
+            bk = read_bpb(rs_img, 2048).bk_boot_sec
+            fresh = f.read((2048 + 32) * SECTOR)
+            for lba in (2048, 2048 + bk):                 # both copies, so only one check objects
+                f.seek(lba * SECTOR + 0x1C)
+                f.write((2047).to_bytes(4, "little"))
+            f.seek(0)
+            skewed = f.read((2048 + 32) * SECTOR)
+        refused = subprocess.run([installer, rs_img], capture_output=True, text=True)
+        with open(rs_img, "r+b") as f:
+            after = f.read(len(skewed))
+            f.seek(0)
+            f.write(fresh)                                # put the real BPB back
+        if refused.returncode == 0:
+            failed.append("case 21: the Rust installer accepted hidden sectors one short of "
+                          "the partition start")
+        elif after != skewed:
+            failed.append("case 21: the Rust installer refused only after writing")
+        elif "hidden-sectors" not in refused.stderr:
+            failed.append(f"case 21: refused, without naming hidden sectors: "
+                          f"{refused.stderr.strip()}")
+        else:
+            print(f"refused, image untouched: {refused.stderr.strip().splitlines()[-1]}")
+
+        cmd_mbr(argparse.Namespace(image=py_img, binary=real_mbr))
+        cmd_vbr(argparse.Namespace(image=py_img, binary=fat32, start=2048))
+        print(sh(installer, rs_img).strip())
+        with open(py_img, "rb") as f1, open(rs_img, "rb") as f2:
+            sector = 0
+            while True:
+                x, y = f1.read(1 << 20), f2.read(1 << 20)
+                if x != y:
+                    n = next(i for i in range(min(len(x), len(y))) if x[i] != y[i]) \
+                        if len(x) == len(y) else min(len(x), len(y))
+                    failed.append(f"case 21: the two installers differ first at LBA "
+                                  f"{sector + n // SECTOR}, byte 0x{n % SECTOR:03X}")
+                    break
+                if not x:
+                    print("the two installers wrote identical images")
+                    break
+                sector += len(x) // SECTOR
+        screen = boot_and_read(rs_img, expect=("SIRIUS-BOOTMGR-", "Sirius: "), timeout=a.timeout)
+        show(screen)
+        if any("SIRIUS-BOOTMGR-OK dl=80" in l for l in screen):
+            print("\n'SIRIUS-BOOTMGR-OK dl=80' is on screen")
+        else:
+            failed.append("case 21: media from the Rust installer did not boot the stand-in")
+        rust_volume = rs_img
+
+        # The largest cluster a FAT32 plan can choose is 64 KiB: 128 sectors, so
+        # the loader's per-cluster count starts at the top of what its byte field
+        # can hold, and BOOTMGR is eight clusters. Nothing before this booted one.
+        print("\n--- case 22: 64 KiB clusters, the largest a FAT32 plan can choose ---")
+        wide = os.path.join(tmp, "wide.img")
+        cmd_build(argparse.Namespace(image=wide, size_mib=4300, label="BOOTTEST",
+                                     start=2048, sec_per_clus=128))
+        cmd_put(argparse.Namespace(image=wide, source=bootmgr, name="BOOTMGR", start=2048,
+                                   attr="0x27", raw_name=None, deleted=False, scatter=True,
+                                   lfn=None))
+        print(sh(installer, wide).strip())
+        screen = boot_and_read(wide, expect=("SIRIUS-BOOTMGR-", "Sirius: "), timeout=a.timeout)
+        show(screen)
+        if any("SIRIUS-BOOTMGR-OK dl=80" in l for l in screen):
+            print("\n'SIRIUS-BOOTMGR-OK dl=80' is on screen")
+        else:
+            failed.append("case 22: a 64 KiB-cluster volume did not boot the stand-in")
+
+        # BOOTMGR_MAX in bootcode.rs is the size the flasher refuses past, so it
+        # has to be exactly what fat32.asm loads: a BOOTMGR that size arrives
+        # whole, and one that spills into the next sector loses that sector --
+        # the first one past the load cap. The spill is eight bytes, not one:
+        # the stand-in's last sector must hold its number and the "END!" tail,
+        # or it reports itself bad loaded or not (stand_in refuses such sizes).
+        # The constant is asked of the Rust binary, so changing either side
+        # without the other fails here.
+        print("\n--- case 23: a BOOTMGR of exactly BOOTMGR_MAX bytes loads whole; one sector more does not ---")
+        cap = int(sh(installer, "--bootmgr-max"))
+        for size, expect in ((cap, "SIRIUS-BOOTMGR-OK dl=80"),
+                             (cap + 8, f"SIRIUS-BOOTMGR-BAD:S:{cap // SECTOR:08x}")):
+            cap_img = os.path.join(tmp, f"cap-{size}.img")
+            cmd_build(argparse.Namespace(image=cap_img, size_mib=512, label="BOOTTEST",
+                                         start=2048, sec_per_clus=8))
+            cmd_put(argparse.Namespace(image=cap_img,
+                                       source=stand_in(size, os.path.join(tmp, f"bootmgr-{size}.bin")),
+                                       name="BOOTMGR", start=2048, attr="0x27", raw_name=None,
+                                       deleted=False, scatter=False, lfn=None))
+            print(sh(installer, cap_img).strip())
+            screen = boot_and_read(cap_img, expect=("SIRIUS-BOOTMGR-", "Sirius: "),
+                                   timeout=a.timeout)
+            show(screen)
+            if any(expect in l for l in screen):
+                print(f"\n{size} bytes: {expect!r} is on screen")
+            else:
+                failed.append(f"case 23: a {size}-byte BOOTMGR (BOOTMGR_MAX is {cap}) did not "
+                              f"give {expect!r}")
+
         # The hostile layout was written by `put`, so fsck.fat checks it is a
         # legal FAT32 volume and not merely one our loader happens to read.
         if shutil.which("fsck.fat") is None:
             print("fsck.fat not installed — skipping its check of cases 16 and 17 (skipped, not passing)")
         else:
-            for case, vimg in ((16, plain), (17, hostile)):
+            for case, vimg in ((16, plain), (17, hostile), (21, rust_volume)):
                 part = os.path.join(tmp, f"part-{case}.img")
                 sh("dd", f"if={vimg}", f"of={part}", "bs=512", "skip=2048",
                    "conv=sparse", "status=none")
@@ -1046,7 +1238,8 @@ def cmd_selftest(a):
         return 1
     print("\nSELFTEST PASSED: the harness detects a booting MBR and a dead one; our MBR "
           "chainloads, refuses, hands over correctly, and copes with CHS-only and wrong-DL "
-          "firmware; our FAT32 VBR finds and loads BOOTMGR from tidy and hostile volumes")
+          "firmware; our FAT32 VBR finds and loads BOOTMGR from tidy and hostile volumes; and "
+          "the Rust installer core ships writes what the harness's does, and it boots")
     return 0
 
 
@@ -1077,6 +1270,11 @@ def main():
     v.add_argument("--start", type=int, default=2048)
     v.set_defaults(func=cmd_vbr)
 
+    i = sub.add_parser("install", help="install our MBR and FAT32 VBR with the Rust installer "
+                                       "core ships (bootcode.rs), checks and read-back included")
+    i.add_argument("image")
+    i.set_defaults(func=cmd_install)
+
     t = sub.add_parser("put", help="write a file into the FAT32 root directory")
     t.add_argument("image")
     t.add_argument("source")
@@ -1096,6 +1294,11 @@ def main():
     r.add_argument("--timeout", type=int, default=25)
     r.add_argument("--settle", type=float, default=0.0,
                    help="keep reading this many seconds after --expect appears")
+    r.add_argument("--kvm", action="store_true",
+                   help="use KVM (needs /dev/kvm); TCG otherwise")
+    r.add_argument("--memory", type=int, default=64, help="guest RAM in MiB")
+    r.add_argument("--screendump", metavar="PNG",
+                   help="save the final screen, graphics modes included, as a PNG")
     r.set_defaults(func=cmd_run)
 
     s = sub.add_parser("selftest", help="prove the harness detects pass AND fail")

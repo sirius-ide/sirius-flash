@@ -5,6 +5,7 @@
 //! (`sdb`, `nvme0n1`) are treated as unstable and never trusted for targeting.
 
 pub mod blockio;
+pub mod bootcode;
 pub mod format;
 pub mod lzw;
 pub use blockio::{hex, Progress, Stage};
@@ -119,6 +120,23 @@ impl WindowsTweaks {
     /// True when nothing is enabled, so no answer file needs writing.
     pub fn is_noop(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// What to tell the user before writing Windows media for a BIOS target
+    /// with these tweaks, if anything — before the confirmation, and in this
+    /// wording wherever it is shown, so the CLI and the GUI cannot drift
+    /// (invariant 14).
+    ///
+    /// Windows 11 Setup checks for Secure Boot and a TPM, and a machine started
+    /// in BIOS mode has no Secure Boot to report, so Setup refuses it unless
+    /// both checks are bypassed. Whether the image is Windows 11 is not known
+    /// here yet, so the sentence says which versions it applies to.
+    pub fn bios_caveat(&self) -> Option<&'static str> {
+        (!(self.bypass_secure_boot && self.bypass_tpm)).then_some(
+            "Windows 11 Setup refuses a machine started in BIOS mode unless its Secure Boot \
+             and TPM checks are bypassed, and these settings do not bypass both. Windows 10 \
+             and earlier need neither.",
+        )
     }
 
     /// Reject account names Windows reserves; strip characters it forbids.
@@ -461,7 +479,11 @@ pub fn list_removable_devices() -> Result<Vec<UsbDevice>> {
         // `size` is in 512-byte units whatever the logical block size is, so
         // this stays x512 even on 4Kn media.
         let size_bytes = read_u64(&sys.join("size")).unwrap_or(0) * 512;
-        let sector_size = read_u64(&sys.join("queue/logical_block_size")).unwrap_or(512) as u32;
+        // Unknown is not 512. A 4Kn stick read as 512 would pass the BIOS gate
+        // and be refused only after the wipe; 0 makes `validate` refuse every
+        // plan that formats, before anything is written. A raw image needs no
+        // sector size and still writes.
+        let sector_size = read_u64(&sys.join("queue/logical_block_size")).unwrap_or(0) as u32;
         let model = fs::read_to_string(sys.join("device/model"))
             .unwrap_or_default()
             .trim()
@@ -673,18 +695,86 @@ pub const UEFI_NTFS_SHA256: &str =
 /// The helper partition goes last, as Rufus places it. The loader finds its
 /// target by reading each volume's filesystem magic rather than by partition
 /// number, so the order is about keeping Windows Setup happy, not about boot.
+///
+/// An MBR drive is BIOS media: one partition, type 0x0C (FAT32 with LBA),
+/// marked active and starting 1 MiB in — exactly what `mbr.asm` boots and what
+/// [`bootcode::prepare`] checks for before anything is installed.
 #[cfg(target_os = "linux")]
 fn partition_for_layout(
     dev: &str,
     device_size: u64,
     sector_size: u64,
+    scheme: format::PartitionScheme,
     layout: format::WindowsLayout,
 ) -> Result<()> {
+    let script = partition_script(device_size, sector_size, scheme, layout)?;
+    let mut child = Command::new("sfdisk")
+        .arg("--quiet")
+        .arg(dev)
+        .env("LC_ALL", "C.UTF-8")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| "failed to spawn `sfdisk`")?;
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin was piped")
+        .write_all(script.as_bytes())
+        .context("writing the partition script to sfdisk")?;
+    let status = child.wait().context("waiting for sfdisk")?;
+    if !status.success() {
+        bail!("`sfdisk` exited with {status} while partitioning {dev}");
+    }
+    if scheme == format::PartitionScheme::Mbr {
+        // sfdisk keeps the first 440 bytes of whatever was there, so a stick
+        // that last held BIOS media — ours or any other loader's — would keep
+        // that boot code in front of the new table. Ours goes on last, once the
+        // volume is complete; clearing the old one now means a copy that fails
+        // leaves no boot code at all, not an old loader in front of half an
+        // installer.
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .open(dev)
+            .with_context(|| format!("opening {dev} to clear its old boot code"))?;
+        f.write_all(&vec![0u8; bootcode::MBR_CODE.len()])
+            .context("clearing the old boot code")?;
+        f.sync_all().context("syncing the cleared boot code")?;
+    }
+    Ok(())
+}
+
+/// The `sfdisk` script for a scheme and layout.
+#[cfg(target_os = "linux")]
+fn partition_script(
+    device_size: u64,
+    sector_size: u64,
+    scheme: format::PartitionScheme,
+    layout: format::WindowsLayout,
+) -> Result<String> {
     const MIB: u64 = 1024 * 1024;
     let total = device_size / sector_size;
+    // The one place the start is decided; mkfs.fat's hidden-sectors value and
+    // the plan's volume size are both derived from the same constant.
+    let first = WINDOWS_PARTITION_START / sector_size;
+
+    if scheme == format::PartitionScheme::Mbr {
+        if layout != format::WindowsLayout::Fat32Split {
+            bail!(
+                "an MBR drive is BIOS media, and the only BIOS boot record this build writes is \
+                 FAT32's"
+            );
+        }
+        let size = total.saturating_sub(first);
+        if size == 0 || size > u64::from(u32::MAX) {
+            bail!("an MBR partition cannot span this drive ({total} sectors)");
+        }
+        return Ok(format!(
+            "label: dos\nstart={first}, size={size}, type=c, bootable\n"
+        ));
+    }
+
     // GPT keeps its backup header and entry array in the last 33 sectors.
     let last_usable = total.saturating_sub(34);
-    let first = MIB / sector_size;
     const BASIC_DATA: &str = "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7";
 
     let script = if layout.needs_uefi_ntfs_partition() {
@@ -708,25 +798,7 @@ fn partition_for_layout(
             last_usable - first + 1
         )
     };
-
-    let mut child = Command::new("sfdisk")
-        .arg("--quiet")
-        .arg(dev)
-        .env("LC_ALL", "C.UTF-8")
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .with_context(|| "failed to spawn `sfdisk`")?;
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin was piped")
-        .write_all(script.as_bytes())
-        .context("writing the partition script to sfdisk")?;
-    let status = child.wait().context("waiting for sfdisk")?;
-    if !status.success() {
-        bail!("`sfdisk` exited with {status} while partitioning {dev}");
-    }
-    Ok(())
+    Ok(script)
 }
 
 /// Exposed so the layout can be exercised against a plain file, which is how
@@ -737,9 +809,268 @@ pub fn partition_for_layout_for_test(
     dev: &str,
     device_size: u64,
     sector_size: u64,
+    scheme: format::PartitionScheme,
     layout: format::WindowsLayout,
 ) -> Result<()> {
-    partition_for_layout(dev, device_size, sector_size, layout)
+    partition_for_layout(dev, device_size, sector_size, scheme, layout)
+}
+
+/// `mkfs.fat`'s arguments for a plan, everything but the device.
+///
+/// `hidden_sectors` is where the partition starts, for media a BIOS boots.
+/// `mkfs.fat` works it out from the device's geometry when it can, and when it
+/// cannot it writes 0 without a word — and `fat32.asm` adds that field to every
+/// sector it reads. So BIOS media says it explicitly, and
+/// [`bootcode::prepare`] still checks the result against the partition table.
+#[cfg(target_os = "linux")]
+fn mkfs_fat_args(plan: &format::FormatPlan, hidden_sectors: Option<u64>) -> Vec<String> {
+    // `-s` is sectors per cluster, not bytes.
+    let spc = plan.cluster_size() / plan.volume().sector_size;
+    let mut args: Vec<String> = vec![
+        "-F".into(),
+        "32".into(),
+        "-s".into(),
+        spc.to_string(),
+        "-n".into(),
+        plan.label().into(),
+    ];
+    if let Some(h) = hidden_sectors {
+        args.push("-h".into());
+        args.push(h.to_string());
+    }
+    if !plan.quick() {
+        // `-c` reads every sector and marks the unreadable ones bad. It is
+        // read-only — it writes no pattern and reads none back — so it finds a
+        // failing stick but NOT a fake-capacity counterfeit, whose unwritten
+        // sectors read back fine and whose writes wrap silently. Catching those
+        // needs a write-and-verify pass, which read-back verification after the
+        // image is written already does.
+        args.push("-c".into());
+    }
+    args
+}
+
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn mkfs_fat_args_for_test(
+    plan: &format::FormatPlan,
+    hidden_sectors: Option<u64>,
+) -> Vec<String> {
+    mkfs_fat_args(plan, hidden_sectors)
+}
+
+/// What a BIOS needs from the image, checked while the drive is intact.
+///
+/// Our MBR boots our VBR, which loads `\bootmgr`; BOOTMGR then reads
+/// `\boot\bcd`. An image without both — any ARM64 Windows ISO, for one — would
+/// make a stick that says "BOOTMGR not found" on every machine. And the VBR
+/// stops loading at the EBDA's doorstep, so a BOOTMGR larger than that would
+/// arrive truncated and call itself corrupt. Invariant 1: find out now.
+#[cfg(target_os = "linux")]
+fn check_bios_boot_files(root: &Path) -> Result<()> {
+    let bootmgr = child_ignoring_case(root, "bootmgr").filter(|p| p.is_file());
+    let bcd = child_ignoring_case(root, "boot")
+        .and_then(|b| child_ignoring_case(&b, "bcd"))
+        .filter(|p| p.is_file());
+    let Some(bootmgr) = bootmgr else {
+        bail!(
+            "this image has no \\bootmgr, which is what a BIOS boots, so it cannot be made into \
+             BIOS media; target UEFI instead"
+        );
+    };
+    if bcd.is_none() {
+        bail!(
+            "this image has \\bootmgr but no \\boot\\bcd, which BOOTMGR cannot start Windows \
+             without; it cannot be made into BIOS media"
+        );
+    }
+    let size = fs::metadata(&bootmgr)?.len();
+    if size > bootcode::BOOTMGR_MAX {
+        bail!(
+            "this image's bootmgr is {size} bytes, and the BIOS boot code loads at most {} \
+             before it would reach the EBDA",
+            bootcode::BOOTMGR_MAX
+        );
+    }
+    Ok(())
+}
+
+/// Check the freshly formatted drive the way a BIOS will read it, then put
+/// the volume boot record on it.
+///
+/// Read through the whole disk, because LBA 0 and the active partition's first
+/// sector are what the BIOS reads; written through the partition's own device,
+/// because the two are separate block devices with separate page caches, and
+/// the kernel's FAT driver rewrites the boot sector on every mount and unmount
+/// (its dirty flag lives at byte 0x41) from its own device's cached copy. A
+/// VBR written through the whole disk while anything held a stale copy of the
+/// partition's would be put back to `mkfs.fat`'s code by the next unmount,
+/// silently. Written through the partition, the driver's copy is ours.
+#[cfg(target_os = "linux")]
+fn install_vbr(dev: &str, part: &str, d: &UsbDevice) -> Result<bootcode::Prepared> {
+    // The disk's cache may hold the partition area from before mkfs.fat
+    // wrote it through the partition device.
+    blockio::drop_cache(Path::new(dev))?;
+    let prepared = {
+        let mut disk =
+            fs::File::open(dev).with_context(|| format!("opening {dev} to read it back"))?;
+        bootcode::prepare(&mut disk, d.size_bytes, d.sector_size)
+            .context("the formatted drive is not what the BIOS boot code needs")?
+    };
+    let start = partition_start(part)?;
+    if start != prepared.partition_start() {
+        bail!(
+            "{part} starts at LBA {start}, but the partition table's active entry starts at {}",
+            prepared.partition_start()
+        );
+    }
+    let mut p = fs::OpenOptions::new()
+        .write(true)
+        .open(part)
+        .with_context(|| format!("opening {part} to write its boot record"))?;
+    prepared.write_vbr(&mut p, 0)?;
+    p.sync_all().context("syncing the volume boot record")?;
+    Ok(prepared)
+}
+
+/// Where the kernel says a partition device begins, in 512-byte sectors.
+#[cfg(target_os = "linux")]
+fn partition_start(part: &str) -> Result<u64> {
+    let real = fs::canonicalize(part).with_context(|| format!("resolving {part}"))?;
+    let name = real
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("{} has no device name", real.display()))?
+        .to_string();
+    let start = fs::read_to_string(format!("/sys/class/block/{name}/start"))
+        .with_context(|| format!("reading where {name} starts"))?;
+    start
+        .trim()
+        .parse()
+        .with_context(|| format!("parsing where {name} starts: {start:?}"))
+}
+
+/// Unmount `part` wherever it is mounted — by us, or by a desktop automounter,
+/// which mounts a freshly made FAT volume as readily as we do — and fail,
+/// naming the mount points, if any survive.
+///
+/// The BIOS boot sectors cannot be checked or finished on a mounted volume: the
+/// FAT driver keeps its dirty flag in the boot sector, so the primary disagrees
+/// with its backup and the read-back of what we wrote fails, for a reason it
+/// would not name.
+#[cfg(target_os = "linux")]
+fn unmount_everywhere(part: &str) -> Result<()> {
+    for point in mount_points(part)? {
+        let _ = Command::new("umount").arg(&point).status();
+    }
+    let left = mount_points(part)?;
+    if !left.is_empty() {
+        bail!(
+            "{part} is still mounted at {} — by a desktop automounter, perhaps — and the BIOS \
+             boot code cannot be checked or finished on a mounted volume. Unmount it and flash \
+             again.",
+            left.iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Every mount point of a block device, from `/proc/self/mountinfo`.
+#[cfg(target_os = "linux")]
+fn mount_points(dev: &str) -> Result<Vec<PathBuf>> {
+    use std::os::unix::fs::MetadataExt;
+    let rdev = fs::metadata(dev)
+        .with_context(|| format!("reading {dev}"))?
+        .rdev();
+    let info =
+        fs::read_to_string("/proc/self/mountinfo").context("reading /proc/self/mountinfo")?;
+    Ok(mounts_of_device(&info, dev_major(rdev), dev_minor(rdev)))
+}
+
+/// glibc's `gnu_dev_major` and `gnu_dev_minor`.
+#[cfg(target_os = "linux")]
+fn dev_major(rdev: u64) -> u64 {
+    ((rdev >> 8) & 0xfff) | ((rdev >> 32) & 0xffff_f000)
+}
+
+#[cfg(target_os = "linux")]
+fn dev_minor(rdev: u64) -> u64 {
+    (rdev & 0xff) | ((rdev >> 12) & 0xffff_ff00)
+}
+
+/// The mount points in `mountinfo` (the text of `/proc/self/mountinfo`) whose
+/// device is `major:minor`. Field 3 is the device and field 5 the mount point,
+/// with space, tab, newline and backslash escaped as `\ooo`.
+#[cfg(target_os = "linux")]
+fn mounts_of_device(mountinfo: &str, major: u64, minor: u64) -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let want = format!("{major}:{minor}");
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(' ');
+            let device = fields.nth(2)?;
+            let point = fields.nth(1)?;
+            if device != want {
+                return None;
+            }
+            let b = point.as_bytes();
+            let mut out = Vec::with_capacity(b.len());
+            let mut i = 0;
+            while i < b.len() {
+                let octal = |c: u8| (b'0'..=b'7').contains(&c);
+                if b[i] == b'\\' && i + 4 <= b.len() && b[i + 1..i + 4].iter().all(|&c| octal(c)) {
+                    out.push((b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0'));
+                    i += 4;
+                } else {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            }
+            Some(PathBuf::from(std::ffi::OsString::from_vec(out)))
+        })
+        .collect()
+}
+
+/// Read the boot records back, then write the MBR boot code and read that
+/// back too — every read from the device, not the page cache, which holds what
+/// we wrote whether or not the stick took it.
+///
+/// The MBR is the last write, once the volume is complete and unmounted
+/// everywhere: until then the drive has no boot code at all (the partitioning
+/// cleared it), so a copy that failed never starts. The boot records are read
+/// back before it, because closing a whole disk that was written makes udev
+/// re-read its partition table, and an automounter may mount the volume again
+/// as it reappears — setting its dirty flag in the very sector being checked.
+/// The read-back also covers whatever the FAT driver did to the boot sector
+/// while the volume was mounted.
+#[cfg(target_os = "linux")]
+fn install_mbr_and_verify(dev: &str, prepared: &bootcode::Prepared) -> Result<()> {
+    blockio::drop_cache(Path::new(dev))?;
+    {
+        let mut disk =
+            fs::File::open(dev).with_context(|| format!("opening {dev} to read it back"))?;
+        prepared
+            .verify_vbr(&mut disk)
+            .context("reading the volume boot record back from the drive")?;
+    }
+    {
+        let mut disk = fs::OpenOptions::new()
+            .write(true)
+            .open(dev)
+            .with_context(|| format!("opening {dev} to write its MBR"))?;
+        prepared.write_mbr(&mut disk)?;
+        disk.sync_all().context("syncing the MBR")?;
+    }
+    blockio::drop_cache(Path::new(dev))?;
+    let mut disk = fs::File::open(dev).with_context(|| format!("opening {dev} to read it back"))?;
+    prepared
+        .verify_mbr(&mut disk)
+        .context("reading the MBR back from the drive")?;
+    run("udevadm", &["settle"])
 }
 
 /// Write the vendored UEFI:NTFS image onto its partition.
@@ -976,7 +1307,8 @@ pub fn flash_windows_iso(
     // Which layout? Rufus's trigger is the size of the largest file, and we
     // follow it — but unlike Rufus we say what the choice costs, here, while
     // the drive is still intact and the user can still change their mind.
-    let layout = layout.unwrap_or_else(|| format::WindowsLayout::default_for(img_size));
+    let layout = layout
+        .unwrap_or_else(|| format::WindowsLayout::default_for_target(img_size, request.target));
     println!("layout: {}", layout.as_str());
     if let Some(caveat) = layout.caveat() {
         println!("note: {caveat}");
@@ -1006,25 +1338,38 @@ pub fn flash_windows_iso(
         println!("note: {w}");
     }
     let plan = &plan;
+    let bios = plan.needs_boot_code();
 
     // Which bootloader does this ISO actually carry? An ARM64 Windows ISO has
     // `bootaa64.efi`, not `bootx64.efi`. Finding that out after the copy — which
     // is where the check used to be — means the drive is already wiped and the
     // installer already written before we notice. Invariant 1.
-    let boot_name = match find_efi_bootloader(Path::new(iso_mnt)) {
-        Some(p) => p
-            .file_name()
-            .map(|n| n.to_string_lossy().to_lowercase())
-            .unwrap_or_default(),
-        None => {
-            let _ = Command::new("umount").arg(iso_mnt).status();
-            bail!(
-                "{} has no \\EFI\\BOOT bootloader, so UEFI firmware would have nothing to \
-                 start — it cannot be made into bootable media this way",
-                iso.display()
-            );
+    let boot_name = if plan.target().needs_uefi() {
+        match find_efi_bootloader(Path::new(iso_mnt)) {
+            Some(p) => Some(
+                p.file_name()
+                    .map(|n| n.to_string_lossy().to_lowercase())
+                    .unwrap_or_default(),
+            ),
+            None => {
+                let _ = Command::new("umount").arg(iso_mnt).status();
+                bail!(
+                    "{} has no \\EFI\\BOOT bootloader, so UEFI firmware would have nothing to \
+                     start — it cannot be made into bootable media this way",
+                    iso.display()
+                );
+            }
         }
+    } else {
+        None
     };
+    // And for a BIOS, what our boot code will load. Same reason, same place.
+    if bios {
+        if let Err(e) = check_bios_boot_files(Path::new(iso_mnt)) {
+            let _ = Command::new("umount").arg(iso_mnt).status();
+            return Err(e);
+        }
+    }
 
     // Does it fit? The filesystem goes on partition 1, which starts 1 MiB in,
     // and FAT32's own tables cost a little more on top. Checking this after the
@@ -1062,6 +1407,10 @@ pub fn flash_windows_iso(
         }
         format::WindowsLayout::NtfsUefiNtfs => needed.push("mkfs.ntfs"),
     }
+    if bios {
+        // To read the boot sectors back from the drive rather than the cache.
+        needed.push("blockdev");
+    }
     if let Err(e) = require_tools(&needed) {
         let _ = Command::new("umount").arg(iso_mnt).status();
         return Err(e);
@@ -1086,26 +1435,23 @@ pub fn flash_windows_iso(
         .status();
 
     let part2 = format!("{dev}-part2");
-    let result = (|| -> Result<()> {
-        partition_for_layout(&dev, d.size_bytes, u64::from(d.sector_size), layout)?;
+    let result = (|| -> Result<Option<bootcode::Prepared>> {
+        partition_for_layout(
+            &dev,
+            d.size_bytes,
+            u64::from(d.sector_size),
+            plan.scheme(),
+            layout,
+        )?;
         run("udevadm", &["settle"])?;
 
         match layout {
             format::WindowsLayout::Fat32Split => {
-                // `-s` is sectors per cluster, not bytes.
-                let spc = (plan.cluster_size() / plan.volume().sector_size).to_string();
-                let mut mkfs = vec!["-F", "32", "-s", &spc, "-n", plan.label()];
-                if !plan.quick() {
-                    // `-c` reads every sector and marks the unreadable ones bad.
-                    // It is read-only — it writes no pattern and reads none back
-                    // — so it finds a failing stick but NOT a fake-capacity
-                    // counterfeit, whose unwritten sectors read back fine and
-                    // whose writes wrap silently. Catching those needs a
-                    // write-and-verify pass, which read-back verification after
-                    // the image is written already does.
-                    mkfs.push("-c");
-                }
-                mkfs.push(&part1);
+                let hidden =
+                    bios.then(|| WINDOWS_PARTITION_START / u64::from(plan.volume().sector_size));
+                let mut mkfs = mkfs_fat_args(plan, hidden);
+                mkfs.push(part1.clone());
+                let mkfs: Vec<&str> = mkfs.iter().map(String::as_str).collect();
                 run("mkfs.fat", &mkfs)?;
             }
             format::WindowsLayout::NtfsUefiNtfs => {
@@ -1142,6 +1488,18 @@ pub fn flash_windows_iso(
                 write_uefi_ntfs(&part2)?;
             }
         }
+        // BIOS media gets its volume boot record now, before the volume is
+        // ever mounted, and its MBR last (below).
+        let prepared = if bios {
+            // mkfs.fat closing the partition makes udev look at the new
+            // filesystem, and an automounter may mount it: let that settle,
+            // then undo it.
+            run("udevadm", &["settle"])?;
+            unmount_everywhere(&part1)?;
+            Some(install_vbr(&dev, &part1, d)?)
+        } else {
+            None
+        };
         run("mount", &[&part1, usb_mnt])?;
 
         // FAT32 cannot store a file of 4 GiB or more, so an oversized install
@@ -1195,19 +1553,29 @@ pub fn flash_windows_iso(
                 }
             }
         }
-        if find_efi_bootloader(Path::new(usb_mnt)).is_none() {
-            bail!("verification failed: efi/boot/{boot_name} missing on USB");
+        if let Some(name) = &boot_name {
+            if find_efi_bootloader(Path::new(usb_mnt)).is_none() {
+                bail!("verification failed: efi/boot/{name} missing on USB");
+            }
+        }
+        if bios && child_ignoring_case(Path::new(usb_mnt), "bootmgr").is_none() {
+            bail!("verification failed: bootmgr missing on USB");
         }
         if !Path::new(&format!("{usb_mnt}/sources/boot.wim")).exists() {
             bail!("verification failed: sources/boot.wim missing on USB");
         }
         run("sync", &[])?;
-        Ok(())
+        Ok(prepared)
     })();
 
     let _ = Command::new("umount").arg(usb_mnt).status();
     let _ = Command::new("umount").arg(iso_mnt).status();
-    result
+    if let Some(prepared) = result? {
+        // Ours is gone; an automounter's may not be.
+        unmount_everywhere(&part1)?;
+        install_mbr_and_verify(&dev, &prepared)?;
+    }
+    Ok(())
 }
 
 /// Write a Linux/other bootable ISO directly to the device. Requires root; erases the device.
@@ -1521,16 +1889,24 @@ mod tests {
         ))
         .expect("GPT + UEFI + FAT32 is what we already make");
 
-        // BIOS needs boot code we do not write.
-        let err = assert_buildable(&plan(
+        // BIOS + FAT32: our MBR and our FAT32 boot record.
+        assert_buildable(&plan(
             PartitionScheme::Mbr,
             TargetSystem::Bios,
             FileSystem::Fat32,
         ))
+        .expect("MBR + BIOS + FAT32 is what bootcode installs");
+
+        // BIOS + NTFS needs an NTFS boot record, which we do not write.
+        let err = assert_buildable(&plan(
+            PartitionScheme::Mbr,
+            TargetSystem::Bios,
+            FileSystem::Ntfs,
+        ))
         .unwrap_err();
-        assert!(err.to_string().contains("MBR bootstrap"), "got: {err}");
+        assert!(err.to_string().contains("FAT32 only"), "got: {err}");
         assert!(
-            err.to_string().contains("MBR + bios"),
+            err.to_string().contains("MBR + bios + ntfs"),
             "the message must name the combination: {err}"
         );
 
@@ -1650,8 +2026,271 @@ mod tests {
         assert!(!WindowsLayout::NtfsUefiNtfs.needs_splitter(5 * GIB));
         // Everything the preflight names must be a real tool on this machine,
         // or the check would fire spuriously on a working system.
-        for t in ["sfdisk", "udevadm", "mount", "umount", "sync", "mkfs.fat"] {
+        for t in [
+            "sfdisk", "udevadm", "mount", "umount", "sync", "mkfs.fat", "blockdev",
+        ] {
             assert!(tool_exists(t), "{t} is expected on a Linux build host");
+        }
+    }
+
+    // ---- BIOS media, built the way the flasher builds it, on a file ----
+
+    #[cfg(target_os = "linux")]
+    fn scratch_file(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sirius-bios-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("disk.img")
+    }
+
+    /// The partition table the flasher writes for BIOS media is the one the
+    /// installer and `mbr.asm` insist on: one entry, active, type 0x0C,
+    /// starting 1 MiB in and running to the end of the drive. Checked with
+    /// the real `sfdisk`, read back by the installer's own parser.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_mbr_layout_is_one_active_fat32_partition() {
+        const SIZE: u64 = 256 * 1024 * 1024;
+        let img = scratch_file("table");
+        fs::File::create(&img).unwrap().set_len(SIZE).unwrap();
+        partition_for_layout_for_test(
+            img.to_str().unwrap(),
+            SIZE,
+            512,
+            format::PartitionScheme::Mbr,
+            format::WindowsLayout::Fat32Split,
+        )
+        .expect("sfdisk partitions a plain file");
+        let sector0 = fs::read(&img).unwrap()[..512].to_vec();
+        assert_eq!(&sector0[510..], &[0x55, 0xAA]);
+        let entry = |i: usize| &sector0[446 + 16 * i..446 + 16 * (i + 1)];
+        assert_eq!(entry(0)[0], 0x80, "active");
+        assert_eq!(entry(0)[4], 0x0C, "FAT32 with LBA");
+        let le = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64;
+        assert_eq!(le(&entry(0)[8..12]), 2048, "1 MiB in");
+        assert_eq!(le(&entry(0)[12..16]), SIZE / 512 - 2048, "to the end");
+        for i in 1..4 {
+            assert_eq!(entry(i), &[0u8; 16], "entry {} is empty", i + 1);
+        }
+        fs::remove_dir_all(img.parent().unwrap()).unwrap();
+
+        // …and NTFS on MBR is refused before sfdisk runs, not after.
+        assert!(partition_script(
+            SIZE,
+            512,
+            format::PartitionScheme::Mbr,
+            format::WindowsLayout::NtfsUefiNtfs
+        )
+        .is_err());
+    }
+
+    /// The whole BIOS path short of the copy, with the real tools: the
+    /// flasher's partition script, `mkfs.fat` with the flasher's arguments for
+    /// a BIOS plan (on a file, so `--offset` stands in for the partition
+    /// device), then the installer — and `fsck.fat` must find the volume
+    /// clean, with no complaint that the two boot sectors differ. That one is
+    /// "mostly harmless" to fsck and exits 0, so its text is the signal.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bios_media_from_the_flashers_own_steps_installs_and_fscks_clean() {
+        const SIZE: u64 = 2 * 1024 * 1024 * 1024;
+        let img = scratch_file("whole");
+        fs::File::create(&img).unwrap().set_len(SIZE).unwrap();
+        let path = img.to_str().unwrap();
+        partition_for_layout_for_test(
+            path,
+            SIZE,
+            512,
+            format::PartitionScheme::Mbr,
+            format::WindowsLayout::Fat32Split,
+        )
+        .unwrap();
+        let plan = format::FormatRequest {
+            scheme: format::PartitionScheme::Mbr,
+            target: format::TargetSystem::Bios,
+            filesystem: format::FileSystem::Fat32,
+            cluster_size: None,
+            label: "WIN11USB".into(),
+            quick: true,
+            uefi_ntfs_helper: false,
+        }
+        .validate(format::Volume::new(windows_volume_size(SIZE), 512))
+        .unwrap();
+        assert_buildable(&plan).unwrap();
+        let first = WINDOWS_PARTITION_START / 512;
+        let mut args = mkfs_fat_args_for_test(&plan, Some(first));
+        args.push(format!("--offset={first}"));
+        args.push(path.into());
+        args.push((windows_volume_size(SIZE) / 1024).to_string());
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        run("mkfs.fat", &args).unwrap();
+
+        let p = bootcode::install_on_image(&img).expect("installs on what the flasher makes");
+        assert_eq!(p.partition_start(), first);
+        assert_eq!(p.vbr_sectors(), &[0, 6]);
+
+        // fsck.fat wants the volume on its own.
+        let part = img.with_file_name("part.img");
+        let status = Command::new("dd")
+            .args([
+                &format!("if={path}"),
+                &format!("of={}", part.display()),
+                "bs=1M",
+                "skip=1",
+                "conv=sparse",
+                "status=none",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let out = Command::new("fsck.fat")
+            .arg("-n")
+            .arg(&part)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "fsck.fat: {text}");
+        assert!(!text.contains("differences"), "fsck.fat: {text}");
+        fs::remove_dir_all(img.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn iso_tree(tag: &str, files: &[(&str, u64)]) -> PathBuf {
+        let root = scratch_file(tag).with_file_name("iso");
+        for (rel, len) in files {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::File::create(&p).unwrap().set_len(*len).unwrap();
+        }
+        root
+    }
+
+    /// Everything a BIOS will need from the image is found before the drive
+    /// is touched: `\bootmgr`, `\boot\bcd`, and a BOOTMGR the VBR can load
+    /// whole. Case does not matter; ISO9660 and UDF disagree about it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bios_media_needs_bootmgr_and_bcd_and_they_are_checked_first() {
+        let ok = iso_tree("ok", &[("bootmgr", 473_364), ("boot/bcd", 16_384)]);
+        check_bios_boot_files(&ok).expect("a Windows 11 ISO's layout");
+        let upper = iso_tree("upper", &[("BOOTMGR", 1), ("BOOT/BCD", 1)]);
+        check_bios_boot_files(&upper).expect("case-insensitive");
+
+        type Files = &'static [(&'static str, u64)];
+        let cases: &[(&str, Files, &str)] = &[
+            ("arm64", &[("boot/bcd", 1)], "no \\bootmgr"),
+            ("nobcd", &[("bootmgr", 1)], "no \\boot\\bcd"),
+            (
+                "huge",
+                &[("bootmgr", bootcode::BOOTMGR_MAX + 1), ("boot/bcd", 1)],
+                "loads at most",
+            ),
+        ];
+        for (tag, files, expect) in cases {
+            let root = iso_tree(tag, files);
+            let err = check_bios_boot_files(&root).unwrap_err();
+            assert!(err.to_string().contains(expect), "{tag}: {err}");
+            fs::remove_dir_all(root.parent().unwrap()).unwrap();
+        }
+        // Exactly the cap is fine: it is the last byte the VBR loads.
+        let edge = iso_tree(
+            "edge",
+            &[("bootmgr", bootcode::BOOTMGR_MAX), ("boot/bcd", 1)],
+        );
+        check_bios_boot_files(&edge).unwrap();
+        for root in [ok, upper, edge] {
+            fs::remove_dir_all(root.parent().unwrap()).unwrap();
+        }
+    }
+
+    /// The BIOS caveat stands until both checks Windows 11 Setup makes of a
+    /// BIOS machine are bypassed, and not a moment longer.
+    #[test]
+    fn the_bios_caveat_holds_until_both_checks_are_bypassed() {
+        let mut t = WindowsTweaks::default();
+        assert!(t.bios_caveat().is_some(), "no bypasses");
+        t.bypass_secure_boot = true;
+        assert!(t.bios_caveat().is_some(), "Secure Boot alone is not enough");
+        t.bypass_secure_boot = false;
+        t.bypass_tpm = true;
+        assert!(t.bios_caveat().is_some(), "TPM alone is not enough");
+        t.bypass_secure_boot = true;
+        assert_eq!(t.bios_caveat(), None, "both bypassed");
+        assert!(WindowsTweaks::default()
+            .bios_caveat()
+            .unwrap()
+            .contains("Windows 11 Setup refuses"));
+    }
+
+    /// The flasher's table step leaves an MBR drive with no boot code at all,
+    /// whatever the stick held before: `sfdisk` keeps the old bytes, and an
+    /// old loader in front of a half-written installer is a stick that boots
+    /// and then dies. Ours is written last, once the volume is complete.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn partitioning_for_bios_clears_the_old_boot_code() {
+        const SIZE: u64 = 64 * 1024 * 1024;
+        let img = scratch_file("stale");
+        let mut d = vec![0u8; SIZE as usize];
+        d[..440].fill(0xAA);
+        fs::write(&img, &d).unwrap();
+        partition_for_layout_for_test(
+            img.to_str().unwrap(),
+            SIZE,
+            512,
+            format::PartitionScheme::Mbr,
+            format::WindowsLayout::Fat32Split,
+        )
+        .unwrap();
+        let sector0 = fs::read(&img).unwrap()[..512].to_vec();
+        assert_eq!(
+            &sector0[..440],
+            &[0u8; 440][..],
+            "the old boot code is gone"
+        );
+        assert_eq!(&sector0[510..], &[0x55, 0xAA], "and the new table is there");
+        fs::remove_dir_all(img.parent().unwrap()).unwrap();
+    }
+
+    /// A mount point with a space in it is escaped in mountinfo as `\040`,
+    /// and every mount of the device is found, not just the first.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mountinfo_names_every_mount_of_a_device() {
+        let info = "\
+22 1 259:5 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p5 rw
+88 22 8:17 / /run/sirius-flash-usb rw,relatime shared:50 - vfat /dev/sdb1 rw
+91 22 8:17 / /run/media/user/MY\\040STICK rw,nosuid shared:52 - vfat /dev/sdb1 rw
+95 22 8:1 / /mnt/other rw shared:55 - vfat /dev/sda1 rw
+";
+        assert_eq!(
+            mounts_of_device(info, 8, 17),
+            vec![
+                PathBuf::from("/run/sirius-flash-usb"),
+                PathBuf::from("/run/media/user/MY STICK")
+            ]
+        );
+        assert!(mounts_of_device(info, 8, 18).is_empty());
+        assert_eq!(mounts_of_device(info, 259, 5), vec![PathBuf::from("/")]);
+    }
+
+    /// glibc's encoding, including the high bits a large minor number uses.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_numbers_decode_as_glibc_does() {
+        let makedev = |major: u64, minor: u64| {
+            ((major & 0xfff) << 8)
+                | ((major & !0xfff) << 32)
+                | (minor & 0xff)
+                | ((minor & !0xff) << 12)
+        };
+        for (major, minor) in [(8, 17), (259, 5), (7, 0), (8, 300), (4095, 1_048_575)] {
+            let rdev = makedev(major, minor);
+            assert_eq!(
+                (dev_major(rdev), dev_minor(rdev)),
+                (major, minor),
+                "{major}:{minor}"
+            );
         }
     }
 

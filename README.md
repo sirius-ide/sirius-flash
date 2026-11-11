@@ -36,9 +36,10 @@ picks the same default and says nothing.
 - [x] UEFI:NTFS dual-partition layout — the default when a file exceeds FAT32's 4 GB limit,
       with WIM splitting kept as the answer for firmware that will not trust it
 - [x] Image formats — see the table below; detected by content, streamed, never buffered
-- [ ] BIOS boot sectors — our own MBR and FAT32 boot record, not Microsoft's blobs:
-      written and boot-tested under qemu (the real Windows 11 `bootmgr` loads), not yet
-      wired into the flasher
+- [x] BIOS boot — our own MBR and FAT32 boot record, not Microsoft's blobs, installed by
+      the flasher for `--target bios` (MBR + FAT32, an oversized install image split).
+      Built step for step as the flasher builds it, the media boots the real Windows 11
+      Setup under qemu with SeaBIOS; not yet tried on real hardware
 - [ ] Built-in ISO downloader (Linux catalogue, then Windows)
 - [ ] macOS backend
 - [ ] Windows backend

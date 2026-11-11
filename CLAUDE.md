@@ -34,9 +34,10 @@ CI runs this across Ubuntu, macOS and Windows. `cargo fmt --check` runs first, s
 unformatted tree hides every later failure. Linux-only imports must be `cfg`-gated or
 `clippy -D warnings` fails the other two platforms on unused imports.
 
-If `scripts/boottest.py`, `scripts/boot/` or `crates/core/boot/` changed, also run
-`./scripts/boottest.py selftest` (needs `qemu-system-x86_64`, `nasm`, `mkfs.fat`,
-`sfdisk`, `fsck.fat`; ~55 s for 20 cases). CI's `boot` job runs it too, but a broken boot
+If `scripts/boottest.py`, `scripts/boot/`, `crates/core/boot/` or
+`crates/core/src/bootcode.rs` changed, also run `./scripts/boottest.py selftest` (needs
+`qemu-system-x86_64`, `nasm`, `mkfs.fat`, `sfdisk`, `fsck.fat` and `cargo`; about a minute
+for 23 cases once the installer is built). CI's `boot` job runs it too, but a broken boot
 sector is cheaper to see here. A changed `.asm` under `crates/core/boot/` needs its `.bin`
 reassembled and committed beside it (`nasm -f bin x.asm -o x.bin`, default optimisation):
 the selftest and CI both diff the two and fail on drift. A new selftest case is not done

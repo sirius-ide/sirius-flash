@@ -70,8 +70,14 @@ impl TargetSystem {
     }
 
     /// Does this target require the firmware to boot the media itself?
-    fn needs_uefi(self) -> bool {
+    pub fn needs_uefi(self) -> bool {
         matches!(self, TargetSystem::Uefi | TargetSystem::BiosOrUefi)
+    }
+
+    /// Does this target boot by running code we put on the media — an MBR
+    /// bootstrap and a partition boot record?
+    pub fn needs_bios_boot_code(self) -> bool {
+        matches!(self, TargetSystem::Bios | TargetSystem::BiosOrUefi)
     }
 }
 
@@ -124,6 +130,16 @@ impl FileSystem {
             // Thirty-two UTF-16 code units.
             FileSystem::Ntfs => 32,
         }
+    }
+
+    /// Does this build carry a partition boot record a BIOS can start this
+    /// filesystem with?
+    ///
+    /// FAT32 only: `boot/fat32.asm`, installed by [`crate::bootcode`]. NTFS and
+    /// exFAT would each need a boot record of their own, and formatting either
+    /// for a BIOS without one makes a drive that silently does not boot.
+    pub fn has_bios_boot_record(self) -> bool {
+        matches!(self, FileSystem::Fat32)
     }
 
     /// Is the label length counted in UTF-16 code units rather than characters?
@@ -291,49 +307,56 @@ impl FormatPlan {
         &self.warnings
     }
 
-    /// Does making this plan *bootable* require boot code we do not write?
+    /// Does making this plan *bootable* require boot code on the media?
     ///
-    /// This is the line between what the options model can describe and what
-    /// this build can actually produce, and it is not the same line.
-    ///
-    /// A UEFI target needs no boot code at all: the firmware reads FAT itself
-    /// and loads `\EFI\BOOT\BOOTX64.EFI` off the volume, which is why the
-    /// existing GPT+FAT32 Windows path works without writing a single byte of
-    /// bootstrap. A BIOS target is the opposite — the firmware only executes
-    /// sector 0, so the media needs an MBR bootstrap *and* a partition boot
-    /// record for the filesystem, which is what Rufus carries `src/ms-sys/`
-    /// for (`write_win7_mbr`, `write_fat_32_br`, `write_ntfs_br`).
-    ///
-    /// We have none of that yet. Formatting for BIOS would succeed and produce
-    /// a drive that silently does not boot, so the flasher refuses instead.
+    /// A UEFI target needs none: the firmware reads FAT itself and loads
+    /// `\EFI\BOOT\BOOTX64.EFI` off the volume, which is why the GPT+FAT32
+    /// Windows path works without writing a single byte of bootstrap. A BIOS
+    /// target is the opposite — the firmware only executes sector 0, so the
+    /// media needs an MBR bootstrap *and* a partition boot record for the
+    /// filesystem, which is what Rufus carries `src/ms-sys/` for
+    /// (`write_win7_mbr`, `write_fat_32_br`, `write_ntfs_br`). Ours are
+    /// `boot/mbr.asm` and `boot/fat32.asm`, installed by [`crate::bootcode`].
     pub fn needs_boot_code(&self) -> bool {
-        matches!(self.target, TargetSystem::Bios | TargetSystem::BiosOrUefi)
+        self.target.needs_bios_boot_code()
     }
 
     /// Can *this build* actually produce bootable media for this plan?
     ///
-    /// [`needs_boot_code`](Self::needs_boot_code) answers a narrower question,
-    /// and a plan can clear it and still be unbuildable — MBR + UEFI needs no
-    /// bootstrap yet is declined for want of a way to boot-test it. This is the
-    /// single authority on the whole gap between what the model can describe
-    /// and what we can make, so that the flasher and anything listing options
-    /// cannot drift apart and quietly promise different things.
+    /// This is the single authority on the gap between what the model can
+    /// describe and what we can make, so that the flasher and anything listing
+    /// options cannot drift apart and quietly promise different things. Each
+    /// refusal is a combination that would format cleanly and then not boot:
+    ///
+    /// - BIOS boot code exists for FAT32 on 512-byte sectors and nothing else
+    ///   — the one boot record we carry, and the one sector size it handles.
+    /// - UEFI firmware reads only FAT, so anything else needs the UEFI:NTFS
+    ///   loader alongside.
+    /// - MBR under a UEFI target, which includes BIOS-or-UEFI, is a real layout
+    ///   that has not been boot-tested here; the harness boots SeaBIOS only.
     ///
     /// `Ok(())` means we would produce media that boots.
     pub fn buildable(&self) -> Result<(), &'static str> {
         if self.needs_boot_code() {
-            return Err(
-                "BIOS media needs an MBR bootstrap and a partition boot record, which \
-                 this build does not write",
-            );
-        }
-        if self.filesystem != FileSystem::Fat32 && !self.uefi_ntfs_helper {
+            if !self.filesystem.has_bios_boot_record() {
+                return Err(
+                    "BIOS media needs a partition boot record for its filesystem, and this \
+                     build writes one for FAT32 only",
+                );
+            }
+            if u64::from(self.volume.sector_size) != crate::bootcode::SECTOR {
+                return Err(
+                    "the BIOS boot code handles 512-byte sectors only, and this drive's are \
+                     larger",
+                );
+            }
+        } else if self.filesystem != FileSystem::Fat32 && !self.uefi_ntfs_helper {
             return Err(
                 "UEFI firmware only reads FAT, so this would need a filesystem driver \
                  loaded before boot",
             );
         }
-        if self.scheme != PartitionScheme::Gpt {
+        if self.target.needs_uefi() && self.scheme != PartitionScheme::Gpt {
             return Err(
                 "MBR with a UEFI target is a valid layout but is not yet boot-verified here",
             );
@@ -994,48 +1017,143 @@ mod tests {
 mod capability_tests {
     use super::*;
 
-    /// The options model deliberately describes more than this build can make.
-    /// A UEFI target needs no boot code — the firmware reads FAT and loads the
-    /// EFI binary itself — while a BIOS target needs an MBR bootstrap and a
-    /// partition boot record that we do not write. Formatting for BIOS would
-    /// succeed and hand the user a drive that silently does not boot, so the
-    /// distinction has to be visible to the flasher.
-    #[test]
-    fn bios_targets_are_flagged_as_needing_boot_code_we_do_not_write() {
-        let v = Volume::new(32 * GB, 512);
-        let uefi = FormatRequest {
-            scheme: PartitionScheme::Gpt,
-            target: TargetSystem::Uefi,
-            filesystem: FileSystem::Fat32,
+    fn plan(
+        scheme: PartitionScheme,
+        target: TargetSystem,
+        filesystem: FileSystem,
+        sector_size: u32,
+    ) -> FormatPlan {
+        FormatRequest {
+            scheme,
+            target,
+            filesystem,
             cluster_size: None,
             label: "SIRIUS".into(),
             quick: true,
             uefi_ntfs_helper: false,
         }
-        .validate(v)
-        .unwrap();
+        .validate(Volume::new(32 * GB, sector_size))
+        .expect("the combination itself is legal")
+    }
+
+    /// A UEFI target needs no boot code — the firmware reads FAT and loads the
+    /// EFI binary itself — while a BIOS target needs an MBR bootstrap and a
+    /// partition boot record on the media.
+    #[test]
+    fn bios_targets_need_boot_code_and_uefi_does_not() {
+        let uefi = plan(
+            PartitionScheme::Gpt,
+            TargetSystem::Uefi,
+            FileSystem::Fat32,
+            512,
+        );
         assert!(
             !uefi.needs_boot_code(),
             "UEFI boots FAT unaided; this is the path that already ships"
         );
-
         for target in [TargetSystem::Bios, TargetSystem::BiosOrUefi] {
-            let plan = FormatRequest {
-                scheme: PartitionScheme::Mbr,
-                target,
-                filesystem: FileSystem::Fat32,
-                cluster_size: None,
-                label: "SIRIUS".into(),
-                quick: true,
-                uefi_ntfs_helper: false,
-            }
-            .validate(v)
-            .unwrap();
-            assert!(
-                plan.needs_boot_code(),
-                "{target:?} media needs bootstrap we cannot write yet"
-            );
+            let p = plan(PartitionScheme::Mbr, target, FileSystem::Fat32, 512);
+            assert!(p.needs_boot_code(), "{target:?} media needs boot code");
         }
+    }
+
+    /// The gate, opened exactly as far as the boot code reaches: MBR + BIOS +
+    /// FAT32 on 512-byte sectors. Everything next to it stays refused, and
+    /// says why, because each would format cleanly and then not boot.
+    #[test]
+    fn the_bios_gate_opens_for_fat32_on_512_byte_sectors_and_nothing_else() {
+        plan(
+            PartitionScheme::Mbr,
+            TargetSystem::Bios,
+            FileSystem::Fat32,
+            512,
+        )
+        .buildable()
+        .expect("MBR + BIOS + FAT32 is what bootcode installs");
+
+        for fs in [FileSystem::Ntfs, FileSystem::ExFat] {
+            let why = plan(PartitionScheme::Mbr, TargetSystem::Bios, fs, 512)
+                .buildable()
+                .unwrap_err();
+            assert!(why.contains("FAT32 only"), "{fs}: {why}");
+        }
+
+        let why = plan(
+            PartitionScheme::Mbr,
+            TargetSystem::Bios,
+            FileSystem::Fat32,
+            4096,
+        )
+        .buildable()
+        .unwrap_err();
+        assert!(why.contains("512-byte sectors"), "4Kn: {why}");
+
+        // BIOS-or-UEFI boots its BIOS half with our code, and its UEFI half
+        // from an MBR disk, which nothing here has booted.
+        let why = plan(
+            PartitionScheme::Mbr,
+            TargetSystem::BiosOrUefi,
+            FileSystem::Fat32,
+            512,
+        )
+        .buildable()
+        .unwrap_err();
+        assert!(why.contains("not yet boot-verified"), "BIOS-or-UEFI: {why}");
+    }
+
+    /// The structural form of the same rule, over everything the model will
+    /// advertise to a GUI: no BIOS plan is buildable unless the boot code we
+    /// carry can boot it.
+    #[test]
+    fn no_buildable_bios_plan_lacks_boot_code_we_carry() {
+        for size in [8 * GB, 32 * GB, 512 * GB] {
+            for sector in [512u32, 4096] {
+                let v = Volume::new(size, sector);
+                for scheme in [PartitionScheme::Mbr, PartitionScheme::Gpt] {
+                    for target in target_systems_for(scheme) {
+                        for fs in filesystems_for(scheme, *target, v) {
+                            let p = FormatRequest {
+                                scheme,
+                                target: *target,
+                                filesystem: fs,
+                                cluster_size: None,
+                                label: "SIRIUS".into(),
+                                quick: true,
+                                uefi_ntfs_helper: false,
+                            }
+                            .validate(v)
+                            .unwrap();
+                            if p.buildable().is_ok() && p.needs_boot_code() {
+                                assert_eq!(scheme, PartitionScheme::Mbr);
+                                assert_eq!(*target, TargetSystem::Bios);
+                                // The fact itself, not the predicate under test:
+                                // FAT32's is the only boot record we carry.
+                                assert_eq!(fs, FileSystem::Fat32);
+                                assert_eq!(sector, 512);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// For a BIOS the layout is the one whose filesystem we carry a boot
+    /// record for, however large the image: the NTFS layout would be refused,
+    /// and an install image over 4 GiB is the ordinary Windows 11 case.
+    #[test]
+    fn a_bios_target_defaults_to_the_layout_it_can_boot() {
+        let big = 5 * GB;
+        for target in [TargetSystem::Bios, TargetSystem::BiosOrUefi] {
+            let l = WindowsLayout::default_for_target(big, target);
+            assert_eq!(l, WindowsLayout::Fat32Split, "{target:?}");
+            assert!(l.filesystem().has_bios_boot_record());
+        }
+        assert_eq!(
+            WindowsLayout::default_for_target(big, TargetSystem::Uefi),
+            WindowsLayout::default_for(big),
+            "UEFI keeps Rufus's rule"
+        );
     }
 }
 
@@ -1231,6 +1349,21 @@ impl WindowsLayout {
         match FileSystem::Fat32.max_file_size() {
             Some(cap) if largest_file > cap => WindowsLayout::NtfsUefiNtfs,
             _ => WindowsLayout::Fat32Split,
+        }
+    }
+
+    /// The default for media that has to boot on `target`.
+    ///
+    /// For UEFI, [`default_for`](Self::default_for). For a BIOS, the layout
+    /// whose filesystem we carry a boot record for — FAT32, splitting an
+    /// oversized install image — whatever the image's size: the NTFS layout
+    /// would be refused by [`FormatPlan::buildable`] and leave nothing to fall
+    /// back to.
+    pub fn default_for_target(largest_file: u64, target: TargetSystem) -> WindowsLayout {
+        if target.needs_bios_boot_code() {
+            WindowsLayout::Fat32Split
+        } else {
+            WindowsLayout::default_for(largest_file)
         }
     }
 
