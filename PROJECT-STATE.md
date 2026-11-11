@@ -3,20 +3,24 @@
 Living handoff document. Anyone (or any new session) picking this up cold should read
 this file first, then `README.md`, then `SECURITY.md`.
 
-**Last updated:** 2026-10-22, second checkpoint of the day. For the commit this describes, ask git —
+**Last updated:** 2026-11-12. For the commit this describes, ask git —
 `git log -1 --format=%h PROJECT-STATE.md`. A hash written into the file by hand
 names the commit *before* the one containing it, and this one had drifted five
 commits before anyone noticed.
 
 ---
 
-## 0. Resume here — checkpoint 2026-10-22 (evening)
+## 0. Resume here — checkpoint 2026-11-12
 
-Branch **`main`**. The units below were each committed separately, in this order: the
-dependency bump (`80c0155`), zip integrity (`8d34a85`), the MBR (`f2e3fe6`), the FAT32
-VBR (`241f6b5`), the Tauri 2.12 set (`5f17de3`), five rebased Dependabot merges, the
-app's sha2 alignment (`3f17aea`), this checkpoint. CI and Security were green on every
-push. Cloud sessions work on a branch (`CLAUDE.md`).
+Branch **`main`**, clean, local = `origin`. No code has changed since the 2026-10-22 work
+below; this checkpoint re-checked GitHub and recorded what arrived since (§8). CI and
+Security were green on every push that day, and the weekly scheduled `Security` run has
+been green since (10-26, 11-02, 11-09). Cloud sessions work on a branch (`CLAUDE.md`).
+
+**What 2026-10-22 delivered**, each its own commit, in order: the dependency bump
+(`80c0155`), zip integrity (`8d34a85`), the MBR (`f2e3fe6`), the FAT32 VBR (`241f6b5`),
+the Tauri 2.12 set (`5f17de3`), five rebased Dependabot merges, the app's sha2 alignment
+(`3f17aea`), then the docs checkpoint and three small doc follow-ups.
 
 - **Verified, not just written:**
   - **`Security` is green**: `zip 9.0.5`, `ruzstd 0.9.1`, both lockfiles audited clean. zip 9
@@ -40,9 +44,15 @@ push. Cloud sessions work on a branch (`CLAUDE.md`).
     Closes GHSA-w28w-mhc8-qvjv (tauri ≤ 2.11.5, high, invisible to `cargo audit`) and the
     three vite alerts.
 - **Written, not wired:** nothing in Rust references `mbr.bin` or `fat32.bin`; `buildable()`
-  still refuses every BIOS target. That is §6 step 3, and it is next.
-- **Do first:** `gh pr list` — one routine lockfile bump (#28, liblzma 0.4.9) may still be
-  open (§8); merge it when green. Then §6 step 3.
+  still refuses every BIOS target. That is §6 step 3, and it is the next real work.
+- **Do first, in this order** (each small):
+  1. **Clear the seven open Dependabot PRs** (§8 has the triage of each; all green on their
+     own CI as of 2026-11-12). #31 and #33 are one Tauri-plugin pair and land together.
+     Four of them touch the workspace `Cargo.lock`, so merging one conflicts the rest —
+     either let Dependabot rebase each in turn, or do the four as one local
+     `cargo update --precise` commit and close the PRs as superseded (§8 says how).
+  2. **Add `timeout-minutes` to every CI job** (§8, "CI's `gui` job can hang"). Ten lines.
+  3. **§6 step 3**: wire both boot binaries into the flasher and open the BIOS gate.
 - **Before trusting this section:** `git fetch`, `gh run list` (CI *and* Security), `gh pr list`.
 
 ## 1. What this is
@@ -613,30 +623,45 @@ hybrid ISOs, and the legacy/packer tail.
 
 ## 8. Open items
 
-- **Dependabot: the 17-PR backlog is cleared; what was done and what is left.** GitHub does
-  not close a PR when a different commit makes the same change, so every supersession was a
-  manual close with a comment naming the commit. Confirm with `gh pr list`.
-  - Closed as superseded by `80c0155`: **#25** (ruzstd 0.9.1) and **#24** (zip 9.0.4; we took
-    9.0.5, which also carries the opt-in fix for GHSA-m665-v7pm-7grj and reads ZIP64 extra
-    fields in spec order).
-  - Closed as superseded by `5f17de3`: **#22, #21, #14, #6** (`app/src-tauri`), **#13, #15,
-    #17, #18, #26, #16** (`app`) and **#27** (source-map-js, opened from a new alert during
-    the session). The Tauri-family PRs could not be merged one at a time: `tauri build`
-    refuses a crate/npm pair that differs in major.minor, and CI's `gui` job never runs
-    `tauri build`, so a mismatched merge would have stayed green. Dependabot `groups` for
-    `tauri*` and `@tauri-apps/*` are now configured so the next family bump arrives as two
-    PRs to land together.
-  - Rebased on the fixed `main`, CI green, merged with `--rebase`: **#23** (sha2 0.11.1,
-    `f38b30f`), **#5** (clap 4.6.7, `4ab2396`), **#9** (actions/setup-node 4→7, `623777c`)
-    and **#10** (pnpm/action-setup 4→6, `6544a77`; both majors were read: the workflow pins
-    `node-version: 22` and `version: 10`). The app's lockfile was then aligned to sha2
-    0.11.1 by hand (`3f17aea`), because Dependabot bumps the two lockfiles separately and
-    `cargo audit --file` reads only what the app's lists.
-  - **#20** (serde_json in `app/src-tauri`) lost a base-branch race during the merges;
-    Dependabot re-opened it as **#29**, which merged once its checks passed (`e9b858d`).
-    **#28** (liblzma 0.4.9, which bumps the bundled xz to 5.8.4 — the library we build
-    statically for `.xz`) arrived during the session and is still open: a routine lockfile
-    patch bump, merge when green.
+- **Dependabot, as of 2026-11-12: seven PRs open, all green on their own CI, none merged.**
+  Re-check with `gh pr list`; Dependabot rebases and re-numbers. Triage, so nobody re-reads
+  the release notes:
+  - **#31 + #33 — `tauri-plugin-dialog` / `@tauri-apps/plugin-dialog` 2.8.3 → 2.8.4.** The
+    first PRs from the Dependabot `groups` added on 10-22, and they arrived exactly as
+    intended: one per side. **Merge both, together.** A patch-level mismatch would not trip
+    `tauri build`'s major.minor check, but keep the pair moving as one so a later minor bump
+    cannot strand one side. No new advisories in `tauri-apps/tauri` or
+    `tauri-apps/plugins-workspace` since 2026-10-01, checked per `SECURITY.md`.
+  - **#35 — `zip` 9.0.5 → 9.4.1.** `Cargo.lock` only (the manifest says `"9"`). The core of
+    this session's zip work — the `ArchiveOffset::Known(0)` open, the CRC-32 check, the
+    damaged-header refusal — is covered by unit tests, and they all pass on the PR's CI,
+    including the test that meters bytes read to open a 4 MiB archive (the guard against
+    zip 9 scanning the whole file). What changed upstream: 9.2.0 added a multi-threaded
+    extraction engine and an index-free iterable reader, neither of which we call; under our
+    `default-features = false, features = ["deflate-flate2"]` zip now also pulls `getrandom`
+    and `libc` as normal dependencies and moves `typed-path` to 0.13. The `wasm-bindgen`
+    family it adds to the lockfile is built only for `wasm32` — checked with `cargo tree -i
+    wasm-bindgen --target` on Linux, macOS and Windows targets: absent. The ~7,000-archive
+    behavioural corpus from 10-22 did not survive (scratch), so the only behavioural evidence
+    is the unit tests; reasonable to merge on that.
+  - **#28 — `liblzma` 0.4.8 → 0.4.9** (bumps the bundled, statically built xz to 5.8.4).
+    Opened 10-22 against `5f17de3`; its green checks predate the later merges, so rebase
+    (`@dependabot rebase`) and merge on the fresh run.
+  - **#34 — `crc32fast` 1.5.2 → 1.5.4** (now a direct dependency, for the zip CRC check),
+    **#37 — `flate2` 1.1.10 → 1.1.11**: routine patch bumps, `Cargo.lock` only.
+  - **#36 — `vite` 8.3.5 → 8.3.6** in `/app`: routine; touches `package.json` and the lockfile.
+  - **#28, #34, #35, #37 all edit the workspace `Cargo.lock`**, so the first merge conflicts
+    the other three. Two ways through: merge one, `@dependabot rebase` the next, wait for
+    green, repeat (four CI cycles, ~15 min each); or one local commit — one `cargo update -p
+    <crate> --precise <version>` per crate (liblzma 0.4.9, crc32fast 1.5.4, zip 9.4.1,
+    flate2 1.1.11), then the same four in `app/src-tauri` so the app's lockfile matches (it links
+    them through `sirius-flash-core`, and `cargo audit --file` only sees what it lists), run
+    the pre-push checks, push, and close the four PRs by hand with a comment naming the
+    commit. GitHub does not close a PR when a different commit makes the same change.
+  - **History (2026-10-22), kept for the pattern:** a 17-PR backlog was cleared — two closed
+    as superseded by `80c0155` (#24, #25), eleven by `5f17de3` (the Tauri family could not be
+    merged piecemeal), five rebased and merged (#23, #5, #9, #10, #29), and the app's
+    lockfile aligned to sha2 by hand (`3f17aea`).
 - **GHSA-w28w-mhc8-qvjv is the kind of advisory `cargo audit` cannot see.** It is published
   in Tauri's repository advisories, not in RustSec, and GitHub raised no Dependabot alert for
   it either. Fixed by the Tauri 2.12 commit; the class remains: for the GUI's framework,
