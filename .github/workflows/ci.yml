@@ -144,3 +144,7 @@ jobs:
           cmp /tmp/fat32.bin crates/core/boot/fat32.bin
       - name: Boot-test harness selftest
         run: ./scripts/boottest.py selftest
+      # The independent check of a written stick's boot records. Its self-test
+      # builds an image with the harness and proves every fault it lists still fails.
+      - name: Stick checker selftest
+        run: ./scripts/check_boot_records.py --selftest
