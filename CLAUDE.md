@@ -22,6 +22,24 @@ Rust + Tauri v2, GPL-3.0, © Clicksora L.L.C.
   are unstable and must never be trusted for targeting.
 - **Stream everything.** Images reach 8 GB and beyond; never read one into memory.
 
+## Real hardware
+
+- Follow `PROJECT-STATE.md` §6 "The next action" step by step. Assert the stick's model,
+  serial, size and removable flag from its by-id path before anything. Write nothing without
+  the owner's explicit go-ahead **in that session**: an earlier session's go-ahead does not
+  carry over.
+- A session runs `sudo` only with a password the owner gives it for that run, after the
+  owner has seen that password work in their own terminal, through the same pipeline the
+  session will use. Never read, `cat`, `grep` or list a credential file, and never hand one
+  to a subagent. Its one use is being piped into `sudo -S` inside the Bash call that runs a
+  step the owner approved. Never put it in argv; never print, log, store or commit it.
+  After one failed validation in a session, stop and ask: PAM locks the account after a
+  few failures. An untracked file in the tree may hold a credential, which is one more
+  reason to commit by explicit path.
+- Check what reached a stick independently of the flasher's own read-back: run
+  `scripts/check_boot_records.py <capture> --disk /dev/disk/by-id/usb-…` on a capture taken
+  after a re-plug, with the stick unmounted, through `dd iflag=direct` on the whole disk.
+
 ## Before pushing
 
 ```bash
@@ -43,6 +61,9 @@ reassembled and committed beside it (`nasm -f bin x.asm -o x.bin`, default optim
 the selftest and CI both diff the two and fail on drift. A new selftest case is not done
 until it has been seen to fail on a *copy* of the tree with one bug put in — each copy with
 its own `CARGO_TARGET_DIR`, because a shared one can silently reuse another copy's build.
+If `scripts/check_boot_records.py` changed, run `./scripts/check_boot_records.py --selftest`
+(a second or two once the installer is built): a fault it stops catching fails it. CI's
+`boot` job runs it too.
 
 ## Commits
 

@@ -10,51 +10,77 @@ commits before anyone noticed.
 
 ---
 
-## 0. Resume here — checkpoint 2026-11-12 (second session)
+## 0. Resume here — checkpoint 2026-11-12 (third session)
 
-Branch **`main`**, clean, local = `origin`. CI and Security green on `bb63f7c` — all five CI
-jobs, with the `boot` job's log checked for all 23 cases rather than trusted for its tick —
-and on each of the three merges before it. No Dependabot PRs open. Cloud sessions work on a
-branch (`CLAUDE.md`).
+Branch **`main`**, local = `origin`. The session began at `8652718` with CI and Security
+green and no PRs open, and added two commits: `scripts/check_boot_records.py`, then this
+checkpoint. Cloud sessions work on a branch (`CLAUDE.md`).
 
-**What this session delivered**, in order:
+**This session prepared the first real-hardware BIOS write and stopped short of it.
+Nothing has been written to any device.**
 
-- On GitHub: Dependabot #33 + #31 (the Tauri dialog pair, together) and #36 (vite)
-  rebase-merged — `a49b4b0`, `92c229e`, `897e159`.
-- `c6b249b` chore(deps): liblzma 0.4.9, crc32fast 1.5.4, zip 9.4.1 and flate2 1.1.11 in both
-  lockfiles, superseding #28, #34, #35 and #37, which were closed by hand with a comment
-  naming it (confirmed closed).
-- `0f8fd2c` chore(deps): the app's tokio 1.54.1 and rustix 1.1.6 (two unsound advisories with
-  fixed releases) and async-executor 1.14.1 (1.14.0 was yanked).
-- `8ae1a7d` fix(ci): every job time-limited (check 30, gui 30, boot 20, audit 20 minutes;
-  they take 1-3), both apt steps 10 minutes with `Acquire::Retries=3`.
-- `d76d7f5` fix(core): the read-back's cache drop must succeed on a block device — the raw
-  path's too, which had ignored a failed `blockdev --flushbufs` and could check RAM.
-- `bb63f7c` feat(boot): **§6 step 3, done** — BIOS boot sectors installed by the flasher;
-  `buildable()` open for MBR + BIOS + FAT32 on 512-byte sectors; CLI `--target bios`.
-- Then this checkpoint.
+- **The stick:** a 64 GB Kingston DataTraveler 3.0 — 61,872,793,600 bytes (57.6 GiB),
+  removable, USB, 512-byte logical and physical sectors — holding one almost empty exFAT
+  partition at LBA 2048, automounted by the desktop (GNOME). The owner confirmed its contents
+  are expendable. Its by-id path names its serial, so it is kept in the session's private
+  memory and the owner's resume prompt, not here (§5).
+- **A dry run of the exact command:** unprivileged, `no` on stdin, it printed
+  `Target : /dev/sdX (57.6 GiB, DataTraveler 3.0)`, `Kind : Windows`, the five bypasses,
+  `Layout : fat32-split` and `Boot : BIOS (MBR, with Sirius Flash's own boot code)`, then
+  `Error: aborted`, with the stick untouched. Nothing before the YES prompt writes
+  (`main.rs` 549-635, read and run).
+- **Why it stopped:** the privileged steps need the owner; this session could not run
+  `sudo` (§6 "The next action" says how a session can, when the owner allows it).
+- **An independent pre-run review of the device-side half** — three lenses (target
+  identity; mounts and the automounter; ordering and failure state), every medium-or-worse
+  finding put to a skeptic told to refute it — found **no path by which any write can reach
+  anything but the stick**: every path the flasher writes through comes from the by-id link.
+  It found ten things to fix, **R1-R10 in §8**. One of them may fail the first run on *this*
+  stick: **R1**, the old exFAT volume survives `sfdisk` at the new partition's exact extent
+  and can be automounted before `mkfs.fat`.
+- **New:** `scripts/check_boot_records.py` checks a raw capture of a stick's first 2080
+  sectors against `mbr.bin`, `fat32.bin` and literal expectations for every BPB field the
+  boot code reads, sharing no code with the flasher. It takes the disk's size from the
+  stick's by-id link (`--disk`), never a kernel name, and refuses to run without it. Its
+  `--selftest`, also run by CI's `boot` job:
+  - builds and installs an image with the harness;
+  - runs the script's own command line on it (7 cases: exit status, FAIL lines, arguments);
+  - requires 58 faults to fail on the check each targets, and 5 lawful variations to pass.
 
-- **Verified, not just written:**
-  - `cargo audit` on both lockfiles: no vulnerabilities. The app's remaining warnings are the
-    accepted glib advisory and four unmaintained crates with no release to move to (§8).
-  - 137 tests and 23 selftest cases, every new one seen to fail on a copy of the tree with
-    one bug put in (§6 has the account, including two tests and one selftest case that were
-    vacuous until a mutation showed it).
-  - **Windows 11 25H2 boots to Setup's "Select language settings" under SeaBIOS** from media
-    built the flasher's way (§6, with the recipe to repeat it, no root needed).
-  - A fresh clone at `bb63f7c` passes fmt, clippy, tests and the selftest, and `d76d7f5`
-    builds and passes on its own.
-- **Written, not verified:** the device-side half of the BIOS path — writing through
-  `/dev/sdX` and `-part1`, unmounting an automounter's mount, the strict cache drop on a real
-  block device — has never run: no root here. Nothing BIOS has met real firmware.
-- **Do first:** the first real-hardware BIOS boot: a local session, a stick targeted by its
-  `/dev/disk/by-id` path, and explicit go-ahead before anything is written (§6, "The next
-  action").
-- **Then:** MBR + UEFI under OVMF, to open BIOS-or-UEFI; a BIOS target in the GUI (§8); the
-  §7 backlog.
-- **Before trusting this section:** `git fetch`, `gh run list` (CI *and* Security),
-  `gh pr list`, and `gh auth status` — on 2026-11-12 the stored `gh` token went invalid
-  mid-session and the push waited on a re-login.
+  An independent review of the first version found that it ignored the BPB fields the boot
+  code reads, so images that cannot boot passed. It also passed silently without a disk
+  size, and never ran its own command line. All three are fixed. Seen to fail: 51 one-line
+  mutants, 50 caught. The survivor starts the BPB range at 0x0C, which is equivalent: byte
+  0x0B is the low byte of bytes-per-sector, 0x00 for every lawful sector size. The mutant
+  list is in the commit message.
+
+- **Verified, not just written:** the stick's identity, size and contents (`lsblk`, sysfs);
+  the dry run; the checker, its self-test and the mutants; `sfdisk` 2.42.4's documented
+  in-use check (BLKRRPART) and its non-interactive default of leaving signatures in new
+  partitions; `mkfs.fat` 4.2 opening its target `O_RDWR|O_EXCL` (the review read the
+  binary); R1's precondition on this stick (same start, same 120,843,252 sectors, in sysfs).
+  This checkpoint was itself read cold, and fact-checked line by line, by two more
+  independent reviewers before it was committed; their corrections are in it.
+- **Written, not verified:** everything device-side, still — `install_vbr` through `-part1`,
+  `unmount_everywhere`, `install_mbr_and_verify` with the strict cache drop — and nothing BIOS
+  has met real firmware. Whether GNOME automounts a partition re-created on an already-present
+  stick is inferred both ways (R1); the run will show it.
+- **Do first:** (1) **fix R1**, one unit: `sfdisk --wipe-partitions always --lock`, with a test
+  on an image whose old filesystem sits at the new partition's exact extent, seen to fail
+  without the flags — then the device-side half meets the stick fixed, not the race; (2) the
+  first real-hardware BIOS write and boot, §6 "The next action", with the owner's explicit
+  go-ahead in that session.
+- **Then:** the same stick in UEFI mode (the first MBR + UEFI data point); R2 (the CLI claims
+  Windows media is "checked file by file"; nothing reads the copy back) and R3 (invariant 2:
+  `--device` accepts a kernel name); the 8 TB disk's serial still in
+  `scripts/make-win11-usb.sh` (§8); MBR + UEFI under OVMF, to open BIOS-or-UEFI; a BIOS target
+  in the GUI; whether `SECURITY.md` lists the four unmaintained app crates (§8).
+- **Before trusting this section:** `gh auth status` (the token went invalid mid-session once),
+  `git fetch`, `git status -sb`, `gh run list --branch main` (CI *and* Security), `gh pr list`.
+- **The previous checkpoint** (second session, `bb63f7c` and before): BIOS boot sectors wired
+  into the flasher and `buildable()` opened for MBR + BIOS + FAT32; Windows 11 25H2 boots to
+  Setup under SeaBIOS from media built the flasher's way; the Dependabot queue cleared; CI
+  jobs time-limited. §6 and §8 carry the detail, `git log` the commits.
 
 ## 1. What this is
 
@@ -124,6 +150,11 @@ scripts/boot/marker_vbr.asm a VBR that checks the MBR's handover contract and
 scripts/boot/marker_bootmgr.asm
                             a stand-in BOOTMGR that checks the VBR's entry contract and
                             that every one of its sectors arrived, in order
+scripts/check_boot_records.py
+                            checks a raw capture of a written stick's first 2080 sectors
+                            against mbr.bin, fat32.bin and the BPB the boot code reads,
+                            sharing no code with the flasher; `--selftest` (also in CI)
+                            proves it fails on 58 known faults
 app/src-tauri/src/lib.rs    Tauri commands; spawns the CLI under pkexec
 app/src/main.ts             frontend logic
 app/index.html              UI (cards ①-④)
@@ -260,7 +291,9 @@ data-loss or dead-stick regression.
   reported as dead. The committed `.bin` beside each `.asm` is what the source assembles
   to at nasm's default optimisation; the selftest and CI both diff it.
 
-## 6. Current phase — format options + UEFI:NTFS
+## 6. Current phase — BIOS boot sectors, then the first real-hardware boot
+
+(Format options and UEFI:NTFS, the phase this section began with, are done; their notes follow.)
 
 Format coverage against Rufus is **done**; what follows is the record of what landed and
 what was deliberately left out.
@@ -392,7 +425,7 @@ putting an assembler on the macOS and Windows build path. The selftest and a CI 
 reassemble and compare; a stale binary fails the build. `bootcode.rs` embeds both, and
 since 2026-11-12 the flasher installs them (step 3, below).
 
-**The harness grew to 20 cases.** `boot_and_read` takes several expected strings and a
+**The harness grew to 20 cases** (23 since). `boot_and_read` takes several expected strings and a
 `floppy` mode (the image as drive A, no hard disk at all); `put` can scatter a file's
 clusters across the FAT in descending order, grow the root directory, write a long-name
 part with a correct checksum, and plant decoy entries. Every case added this session was
@@ -585,34 +618,108 @@ installed.
 **Not verified:** the device-side half — `install_vbr`, `unmount_everywhere` and
 `install_mbr_and_verify` against a real block device, with its page caches, udev, an
 automounter and `blockdev --flushbufs` — has never run; it needs root and a stick. Nor has
-anything met real firmware: DL, AH=08h geometry under USB-HDD emulation, packet reads.
+anything met real firmware: DL, AH=08h geometry under USB-HDD emulation, packet reads. The run
+was prepared on 2026-11-12 (third session) and stopped before the write; the pre-run review's
+findings are R1-R10 in §8.
 
-**The next action: the first real-hardware boot.** A local session; a stick whose contents
-the owner has confirmed are expendable, targeted by its `/dev/disk/by-id` path with model,
-serial, size and removable asserted first; and explicit go-ahead before anything is written.
-The session cannot run `sudo` (it asks for a password), so the owner runs the write in their
-own terminal, from a release build (`cargo build --release -p sirius-flash-cli`):
+**The next action: the first real-hardware boot.** A local session; R1 (§8) fixed first; a
+stick whose contents the owner has confirmed are expendable; and the owner's explicit
+go-ahead, in that session, before anything is written. Status of the steps below:
+- Steps 1 and 2 were run against the stick on 2026-11-12.
+- Step 4's checker was run against image files only.
+- The commands in steps 3-5 were checked against the installed tools' man pages.
+- The write, a capture of a real stick, the file check and the boot have never run.
 
-```bash
-sudo ./target/release/sirius-flash write --iso <Win11.iso> \
-  --device /dev/disk/by-id/usb-… --target bios --bypass-all
-```
+1. **Identify the stick** by its `/dev/disk/by-id/usb-…` path, never a kernel name, and
+   assert model, serial, size and removable: `lsblk -b -d -o
+   NAME,TRAN,RM,HOTPLUG,SIZE,VENDOR,MODEL,SERIAL,LOG-SEC,PHY-SEC /dev/disk/by-id/usb-…`. Look
+   at what it holds and where it is mounted (`lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINTS`,
+   `df -h` on the mount), so the owner confirms with the contents in front of them.
+2. **Build and dry-run:** `cargo build --release -p sirius-flash-cli`, then the exact command
+   below, unprivileged, with `no` on stdin (`printf 'no\n' | ./target/release/sirius-flash
+   write …`). It prints the target, kind, tweaks, layout and boot line, and stops at the YES
+   prompt. Nothing before that prompt writes, and a user outside the `disk` group could not
+   open the device for writing anyway.
+3. **Before the go-ahead, do by hand what R3 and R6 leave undone:**
+   - Show `readlink -f` of the by-id path beside the kernel name the dry run printed.
+   - Re-assert model, serial, size, removable and logical block size from sysfs.
+   - Read-only, on the ISO, run `wimlib-imagex info` on `sources/install.wim`, and confirm
+     that `bootmgr`, `boot/bcd` and `sources/boot.wim` exist.
+   - Unmount the stick's current volume (`udisksctl unmount -b /dev/disk/by-id/usb-…-part1`)
+     and confirm in `/proc/self/mountinfo` that nothing on the stick is mounted. Close
+     anything with its working directory there. Otherwise the pre-wipe `umount` loop fails
+     silently, and `sfdisk` refuses with an in-use error that does not name the mount (R10).
 
-That is also the first run of the device-side half (`install_vbr` through `-part1`,
-`unmount_everywhere`, `install_mbr_and_verify` with the strict cache drop), so its output
-matters as much as the boot: a mount it names, or a read-back that fails, is a finding, not
-noise — reproduce it on an image file before touching the stick again. Then check what
-reached the stick independently of the flasher's own read-back: the owner runs
-`sudo dd if=/dev/disk/by-id/usb-… of=head.bin bs=512 count=2080` (sector 0 through the
-partition's reserved area) and makes it readable, and the session compares: bytes 0-439
-equal `mbr.bin`; exactly one active entry, type 0x0C, at LBA 2048; LBA 2048 equals
-`fat32.bin` everywhere outside 0x0B-0x59, with bytes-per-sector 512 and hidden sectors 2048
-in its BPB; LBA 2054 equals LBA 2048 (take the `dd` with the stick unmounted: a mounted FAT
-volume sets byte 0x41 of LBA 2048, its dirty flag, and only there). Then boot it on a machine
-in legacy/CSM mode. If Setup
-stops at "A media driver your computer needs is missing", check that `sources\install.swm`
-reached the stick before suspecting drivers. The same stick in UEFI mode is the first data
-point for opening MBR + UEFI (it carries `\EFI\BOOT\BOOTX64.EFI` too).
+   Then the write, as root. Never pass `--yes`: the CLI reads `YES` from stdin.
+
+   ```bash
+   sudo ./target/release/sirius-flash write --iso <Win11.iso> \
+     --device /dev/disk/by-id/usb-… --target bios --bypass-all 2>&1 | tee <scratch>/flash.log
+   echo "exit ${PIPESTATUS[0]}"
+   ```
+
+   With no terminal, `read_line` sees end-of-file and the run aborts before writing, so a
+   session running the write feeds `YES` with a here-string, which keeps `sudo` as pipeline
+   element 0: `sudo -n … <<<'YES' 2>&1 | tee …; echo "exit ${PIPESTATUS[0]}"`.
+
+   A session may run it only if the owner has given it a password for that run. The owner
+   must first have seen that password work in their own terminal, through the same pipeline
+   the session will use.
+   - In **one** Bash call, the password goes on stdin to `sudo -S -p '' -v`, never into argv
+     or the transcript, and the `sudo -n` command follows.
+   - This is untested: `sudo -n` relies on sudo keying a terminal-less timestamp to the
+     parent process, so the validation cannot carry over to another shell call.
+   - One failed validation in a session ends it: stop and ask. PAM locks the account after
+     a few failures.
+
+   The copy is about 8.5 GB and may take longer than a foreground tool call, so run it in
+   the background and read the log. Its output is a finding, not noise. If it names a mount,
+   fails a read-back, or `mkfs.fat` refuses a busy device (R1), reproduce that on an image
+   file before touching the stick again.
+4. **Re-plug, unmount, then capture.** Re-plugging means neither the host's cache nor the
+   stick's own can answer with what was last written. The desktop may then mount the volume,
+   as it may after the CLI's last write (R4), setting its dirty flag (LBA 2048, byte 0x41).
+   So unmount it if it is mounted. `udisksctl unmount -b /dev/disk/by-id/usb-…-part1` is
+   expected to need no password for a mount the same user's desktop made. Then:
+
+   ```bash
+   D=/dev/disk/by-id/usb-…        # the whole disk, not -part1
+   sudo dd if="$D" bs=4096 count=260 iflag=direct status=none > <scratch>/head.bin
+   ./scripts/check_boot_records.py <scratch>/head.bin --disk "$D"
+   ```
+
+   `iflag=direct` reads the stick, not the page cache. The redirect leaves the capture
+   owned by the user and outside the repo. `--disk` takes the size from sysfs through the
+   by-id link. The checker wants every line `ok`. Passing proves the boot records only: the
+   FAT, the root directory and BOOTMGR lie past the capture.
+5. **Check the files.** The flasher never reads the copy back (R2). Mount the stick
+   read-only (`udisksctl mount -b …-part1 -o ro`) and the ISO read-only (`udisksctl
+   loop-setup -r -f <ISO>`), and compare every file except `sources/install.wim` by SHA-256.
+   Check the `.swm` set with `wimlib-imagex verify <stick>/sources/install.swm
+   --ref="<stick>/sources/install*.swm"`, which decompresses every file against its
+   checksum (syntax from wimlib 1.14.5's man page). Then compare `wimlib-imagex info` of the
+   set with the ISO's `install.wim`: image count, names and sizes.
+6. **Boot it** in legacy/CSM mode. First ask which machine.
+   - The owner's desktop is a UEFI-only Arch + Windows dual boot with a shared ESP. Turning
+     CSM on there can reorder `BootOrder` or reset NVRAM; the recovery is an
+     `efibootmgr -o` line, in the owner's notes. A spare legacy-capable PC is better.
+   - **Stop at "Select language settings"** (or the first failure). Never continue Setup on
+     a machine whose disks matter.
+   - Record the exact screen text: ours is "Sirius: BOOTMGR not found", "Sirius: disk
+     error", or the MBR's read error, bad partition table or no active partition lines.
+     Also record whether the cursor blinks, and the firmware's vendor, version, boot mode
+     and USB emulation (USB-HDD or USB-ZIP/FDD). No serials.
+   - If the checker was all `ok` and it still does not boot, the bytes are right and the
+     cause is on the firmware side. Reproduce it under qemu with the same BPB and DL before
+     changing code.
+   - If Setup stops at "A media driver your computer needs is missing", check that
+     `sources\install.swm` reached the stick before suspecting drivers.
+   - Write the outcome into §0 and here, and commit it, before any other work: scratch
+     does not survive.
+
+   Then boot the same stick in UEFI mode. That is the first data point for opening MBR +
+   UEFI; the stick carries `\EFI\BOOT\BOOTX64.EFI` too, and per R8 a half-written stick
+   would boot that way as well.
 
 To repeat the Windows run without hardware (no root; `/dev/kvm` and udisks2):
 
@@ -777,6 +884,86 @@ hybrid ISOs, and the legacy/packer tail.
 
 ## 8. Open items
 
+- **The pre-run review of the device-side half, 2026-11-12 (third session).** It ran before
+  the first real-disk write: three independent reviewers, one per lens (target identity; mounts
+  and the automounter; ordering and failure state), each given the code paths and this
+  machine's facts but not the main session's own reading. One skeptic per lens then tried to
+  refute every medium-or-worse finding. **No path writes, formats, unmounts or deletes
+  anything but the stick**, its two fixed `/run/sirius-flash-*` mount points and a
+  read-only loop mount of the ISO. Every device path comes from the by-id link, partition
+  paths are the udev `-part1` links, and nothing as root deletes recursively on this path.
+  Line numbers are as of `8652718`.
+  - **R1 — confirmed; fix before the hardware run.** The flasher's MBR partition is
+    `start=2048, size=<disk>-2048`, which is very often exactly the extent of the partition
+    already on a stick: this one's is identical, 120,843,252 sectors. `sfdisk` run from a
+    script leaves signatures inside new partitions (`-W`/`-w` default `auto` wipe only
+    interactively). So the new `sdb1` is a mountable window onto the old exFAT volume, and
+    udev announces it again after `sfdisk` and again after the 440-byte zeroing
+    (`lib.rs` 711-741). Nothing unmounts, wipes or locks between `sfdisk` and `mkfs.fat`
+    (1439-1455): there is only a `udevadm settle`, which does not wait for the automounter's
+    D-Bus mount. If the desktop mounts it first, `mkfs.fat`'s `O_EXCL` open fails, and the
+    run dies as "`mkfs.fat` exited with exit status: 1" after the table was rewritten. A rerun
+    repeats the race. Fix: `sfdisk --wipe-partitions always --lock`. That is the "per-partition
+    head zeroing" of the Rufus survey (§7), pulled forward. Test it on a plain file with a
+    filesystem at the new partition's exact extent: after partitioning, nothing must probe
+    at the partition's start, and the test must fail without the flags. The skeptic called
+    the reviewer's "high" overstated, since the race itself cannot be decided statically.
+    GNOME's gvfs may not automount a partition that appears long after the media did (recalled
+    from its source, not checked), but KDE's automounter and udiskie are other cases, and the
+    exact-extent precondition is common.
+  - **R2 — confirmed.** `main.rs` 210-214 tell the user that Windows media "is checked
+    file by file" (the comment at 185-186 says the same), and use that to refuse `--no-verify`. Nothing checks it:
+    `copy_tree` (`blockio.rs` 1300-1357) ends each file with a no-op `flush()`, `run("sync")`
+    cannot report writeback errors, the `umount` status is discarded, and the only checks
+    after the copy are `bootmgr` and `sources/boot.wim` existing in the page-cached mount
+    (plus the EFI loader on UEFI targets). `install.swm` is not checked at all. The device-side read-backs cover the VBR, its
+    backup and the MBR only. It is the same family as invariant 13, which `main.rs` 182-183 cite for this very refusal:
+    a claimed check that does not happen. Fix: read the tree back after an unmount, a cache drop and a read-only remount,
+    hashing each file against the source and running `wimlib-imagex verify` on the split
+    set. Until then, correct the text.
+  - **R3 — invariant 2 gap.** `write --device` matches `d.by_id` *or* `d.dev`
+    (`main.rs` 554), so `/dev/sdb` is accepted as a lookup key although `UsbDevice.dev` is
+    documented "for display only" (`lib.rs` 32). The confirm line prints the kernel name,
+    model and size, but not the by-id path or serial (`main.rs` 567-571). Between the
+    device listing and `sfdisk` (the ISO probe, an 8 GB tree walk, an unbounded YES prompt)
+    nothing re-checks the link's target, the size or the removable flag;
+    `assert_safe_target` re-reads the cached struct. It cannot reach the SATA or NVMe
+    disks: they have no `usb-` link, are not removable, or exceed 512 GiB. Fix: accept by-id
+    paths only, print by-id and serial in the confirm, and re-resolve and re-check just
+    before `sfdisk`.
+  - **R4.** The final MBR write makes udev re-read the table, and the desktop may mount the
+    new volume, setting its dirty flag. That can happen after the CLI has printed "Done.
+    Safe to remove the USB." The flasher's own checks are unaffected, since the VBR is
+    verified before that write. A capture taken while it is mounted fails at byte 0x41
+    (§6 step 4).
+  - **R5 — uncertain.** `unmount_everywhere` makes one `umount` attempt per mount point and
+    then fails. After the full copy (`lib.rs` 1575), a transient holder leaves a complete
+    volume with a VBR, no MBR code, and the advice "flash again", meaning the whole copy.
+    Retry briefly before failing, and consider an install-the-boot-code-only path. The
+    skeptic found no event in a normal run that would cause it.
+  - **R6.** Image-dependent steps run after the wipe. The install image is only `stat`ed
+    (`lib.rs` 617), `wimlib-imagex split` first meets it after the copy, and `sources/boot.wim`
+    is checked last (1564). Check `boot.wim` and run `wimlib-imagex info` on the image before
+    anything destructive (invariant 1).
+  - **R7.** Leaked mounts. `tree_size(…)?` (`lib.rs` 1383) returns without unmounting the
+    ISO, and nothing guards against Ctrl-C, SIGTERM or a panic (no `Drop` guard, no handler).
+    A failed run can leave the ISO's loop mount pinning the disk the ISO lives on, and the
+    stick mounted rw. Put both mounts behind a guard.
+  - **R8.** A half-written stick is not inert. After a failure, the MBR has 440 zero bytes of
+    code, a 55 AA and an active entry, so a BIOS jumps into zeros instead of falling through
+    to the next device. UEFI firmware can still start the partial tree's `BOOTX64.EFI`. "A
+    copy that failed never starts" (above) holds for our BIOS loader only. Consider marking
+    the entry active only with the last write.
+  - **R9.** Errors after the wipe never say what state the stick is in, or whether a rerun
+    is safe; only pre-wipe errors say "Nothing has been written". A `\r` progress line runs
+    into the `Error:` line.
+  - **R10.** The pre-wipe `umount` loop (`lib.rs` 1430-1435) discards its result, and
+    `sfdisk` runs without `--lock`. The backstop is `sfdisk`'s in-use refusal, which stops
+    before writing but does not name the mount. `unmount_everywhere` already does that job and
+    names what survives, so use it here too.
+- **Dependabot and secret scanning, re-checked 2026-11-12 (third session):** no PRs open; the
+  only open Dependabot alert is #1, the accepted glib advisory (below); no open
+  secret-scanning alerts.
 - **Dependabot, as of 2026-11-12 (second session): cleared.** #33 + #31 (the Tauri dialog
   pair) and #36 (vite) were rebase-merged on GitHub, in that order, which applies cleanly.
   #28, #34, #35 and #37 all edit the workspace `Cargo.lock`, so merging any one conflicts the
@@ -845,6 +1032,10 @@ hybrid ISOs, and the legacy/packer tail.
 - **The GUI cannot make BIOS media.** `--target bios` is CLI-only; the GUI has no target
   selector. When it gets one, its confirm dialog must show `WindowsTweaks::bios_caveat()`
   and the misplaced-option rule must hold there too (invariants 13 and 14).
+- **A hardware serial is still in a tracked file:** `scripts/make-win11-usb.sh` line 32 names
+  the 8 TB data disk's model and serial in a guard against wiping it. That breaks the
+  no-serials rule. Replace it with a required environment variable naming the protected disk
+  (a small unit; found 2026-11-12, third session).
 - A USB serial and a home path remain in commit `8b95dda`. Deliberately **not** rewritten:
   they are not credentials, and GitHub keeps force-pushed commits reachable by SHA, so a
   rewrite would not remove them. The real remediation — enabling secret scanning, push
@@ -858,6 +1049,7 @@ cargo test --workspace                      # 137 tests
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 cd app && pnpm install && pnpm tauri dev    # GUI
 ./scripts/boottest.py selftest              # 23 boot cases under qemu, about a minute
+./scripts/check_boot_records.py --selftest  # the stick checker: 7 CLI cases, 58 faults, 5 lawful
 ```
 
 CI mirrors exactly that across the three-OS matrix. `cargo fmt --check` runs first, so an
