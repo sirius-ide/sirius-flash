@@ -41,7 +41,8 @@ for 23 cases once the installer is built). CI's `boot` job runs it too, but a br
 sector is cheaper to see here. A changed `.asm` under `crates/core/boot/` needs its `.bin`
 reassembled and committed beside it (`nasm -f bin x.asm -o x.bin`, default optimisation):
 the selftest and CI both diff the two and fail on drift. A new selftest case is not done
-until it has been seen to fail on a *copy* of the tree with one bug put in.
+until it has been seen to fail on a *copy* of the tree with one bug put in — each copy with
+its own `CARGO_TARGET_DIR`, because a shared one can silently reuse another copy's build.
 
 ## Commits
 

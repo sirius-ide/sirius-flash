@@ -247,6 +247,12 @@ data-loss or dead-stick regression.
   BIOS installer found two tests that built their expected value with the module's own
   constant (`BPB_END`) or predicate (`has_bios_boot_record`); the bug moved the expectation
   along with it and both stayed green. Use literal values, or state the fact itself.
+- **Mutants build in their own target directory.** Copies made with `tar` keep their old
+  mtimes, and cargo names a path package's artifacts without the path and judges freshness by
+  mtime, so a mutant whose files are all older than the last build silently reuses that
+  build — another mutant's. It happened on 2026-11-12: a `fat32.asm` mutant ran against the
+  previous Rust mutant's binary and passed for the wrong reason. Set `CARGO_TARGET_DIR` per
+  copy, or `touch` every file in it.
 - **Boot code: seen to fail before believed.** A new selftest case is not trusted until it
   has gone red on a copy of the tree with one bug put in; the repo's sources are never
   edited to do it. Test-only paths are reached through assemble-time symbols (`-D`), the
@@ -581,11 +587,32 @@ installed.
 automounter and `blockdev --flushbufs` — has never run; it needs root and a stick. Nor has
 anything met real firmware: DL, AH=08h geometry under USB-HDD emulation, packet reads.
 
-**The next action: the first real-hardware boot.** A local session, a stick targeted by its
-`/dev/disk/by-id` path, and explicit go-ahead before anything is written:
-`sudo sirius-flash write --iso <Win11.iso> --device /dev/disk/by-id/usb-… --target bios
---bypass-all`, then boot a machine in legacy/CSM mode. The same stick in UEFI mode is the
-first data point for opening MBR + UEFI (it carries `\EFI\BOOT\BOOTX64.EFI` too).
+**The next action: the first real-hardware boot.** A local session; a stick whose contents
+the owner has confirmed are expendable, targeted by its `/dev/disk/by-id` path with model,
+serial, size and removable asserted first; and explicit go-ahead before anything is written.
+The session cannot run `sudo` (it asks for a password), so the owner runs the write in their
+own terminal, from a release build (`cargo build --release -p sirius-flash-cli`):
+
+```bash
+sudo ./target/release/sirius-flash write --iso <Win11.iso> \
+  --device /dev/disk/by-id/usb-… --target bios --bypass-all
+```
+
+That is also the first run of the device-side half (`install_vbr` through `-part1`,
+`unmount_everywhere`, `install_mbr_and_verify` with the strict cache drop), so its output
+matters as much as the boot: a mount it names, or a read-back that fails, is a finding, not
+noise — reproduce it on an image file before touching the stick again. Then check what
+reached the stick independently of the flasher's own read-back: the owner runs
+`sudo dd if=/dev/disk/by-id/usb-… of=head.bin bs=512 count=2080` (sector 0 through the
+partition's reserved area) and makes it readable, and the session compares: bytes 0-439
+equal `mbr.bin`; exactly one active entry, type 0x0C, at LBA 2048; LBA 2048 equals
+`fat32.bin` everywhere outside 0x0B-0x59, with bytes-per-sector 512 and hidden sectors 2048
+in its BPB; LBA 2054 equals LBA 2048 (take the `dd` with the stick unmounted: a mounted FAT
+volume sets byte 0x41 of LBA 2048, its dirty flag, and only there). Then boot it on a machine
+in legacy/CSM mode. If Setup
+stops at "A media driver your computer needs is missing", check that `sources\install.swm`
+reached the stick before suspecting drivers. The same stick in UEFI mode is the first data
+point for opening MBR + UEFI (it carries `\EFI\BOOT\BOOTX64.EFI` too).
 
 To repeat the Windows run without hardware (no root; `/dev/kvm` and udisks2):
 
