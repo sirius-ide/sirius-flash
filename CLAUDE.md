@@ -77,9 +77,10 @@ conversation itself doesn't carry over.
   adversarial review of each finished unit has found more than the unit's own tests every
   time. After a fan-out, check `git status` for files an agent left in the repo, and
   commit by explicit path, never `git add -A`.
-- Commits: propose one Conventional Commit subject per unit and wait for it to be pasted
-  back. If the reply is only "continue", ask once (commit all / commit but leave GitHub
-  actions / not yet) rather than guessing.
+- Commits: when a unit is finished and the checks under "Before pushing" pass, commit it —
+  one Conventional Commit per unit, by explicit path — and push, without waiting for
+  approval. (The owner's rule since 2026-11-12; it replaced proposing each subject and
+  waiting for it to be pasted back.) A cloud session pushes to its branch, as above.
 - The session scratchpad can vanish mid-session. Anything a later session may need goes
   in the repo (`docs/research/` for research notes) or is re-derivable from the commit
   message.
