@@ -10,50 +10,51 @@ commits before anyone noticed.
 
 ---
 
-## 0. Resume here — checkpoint 2026-11-12
+## 0. Resume here — checkpoint 2026-11-12 (second session)
 
-Branch **`main`**, clean, local = `origin`. No code has changed since the 2026-10-22 work
-below; this checkpoint re-checked GitHub and recorded what arrived since (§8). CI and
-Security were green on every push that day, and the weekly scheduled `Security` run has
-been green since (10-26, 11-02, 11-09). Cloud sessions work on a branch (`CLAUDE.md`).
+Branch **`main`**, clean, local = `origin`. CI and Security green on `bb63f7c` — all five CI
+jobs, with the `boot` job's log checked for all 23 cases rather than trusted for its tick —
+and on each of the three merges before it. No Dependabot PRs open. Cloud sessions work on a
+branch (`CLAUDE.md`).
 
-**What 2026-10-22 delivered**, each its own commit, in order: the dependency bump
-(`80c0155`), zip integrity (`8d34a85`), the MBR (`f2e3fe6`), the FAT32 VBR (`241f6b5`),
-the Tauri 2.12 set (`5f17de3`), five rebased Dependabot merges, the app's sha2 alignment
-(`3f17aea`), then the docs checkpoint and three small doc follow-ups.
+**What this session delivered**, in order:
+
+- On GitHub: Dependabot #33 + #31 (the Tauri dialog pair, together) and #36 (vite)
+  rebase-merged — `a49b4b0`, `92c229e`, `897e159`.
+- `c6b249b` chore(deps): liblzma 0.4.9, crc32fast 1.5.4, zip 9.4.1 and flate2 1.1.11 in both
+  lockfiles, superseding #28, #34, #35 and #37, which were closed by hand with a comment
+  naming it (confirmed closed).
+- `0f8fd2c` chore(deps): the app's tokio 1.54.1 and rustix 1.1.6 (two unsound advisories with
+  fixed releases) and async-executor 1.14.1 (1.14.0 was yanked).
+- `8ae1a7d` fix(ci): every job time-limited (check 30, gui 30, boot 20, audit 20 minutes;
+  they take 1-3), both apt steps 10 minutes with `Acquire::Retries=3`.
+- `d76d7f5` fix(core): the read-back's cache drop must succeed on a block device — the raw
+  path's too, which had ignored a failed `blockdev --flushbufs` and could check RAM.
+- `bb63f7c` feat(boot): **§6 step 3, done** — BIOS boot sectors installed by the flasher;
+  `buildable()` open for MBR + BIOS + FAT32 on 512-byte sectors; CLI `--target bios`.
+- Then this checkpoint.
 
 - **Verified, not just written:**
-  - **`Security` is green**: `zip 9.0.5`, `ruzstd 0.9.1`, both lockfiles audited clean. zip 9
-    opens an archive by reading it *end to end* unless told where it starts; we tell it
-    (`ArchiveOffset::Known(0)`): a 2 GiB zip went from ~2 s and 2.1 million syscalls to
-    0.05 ms and 17, measured. A zip member's CRC-32 is now verified and a damaged image
-    member is refused rather than replaced by the next-largest file — both checked against
-    a corpus of ~7,000 real and mutated archives (§8 has the numbers).
-  - **`crates/core/boot/mbr.asm`** (§6): CHS fallback computed from INT 13h AH=08h, DL
-    retried once as 0x80 only when the named drive is absent or a floppy number, LBA-0
-    entries refused, two silent-loop paths closed. Selftest cases 5-15 under SeaBIOS; every
-    new case was seen to fail on a broken copy. **Never on real hardware.**
-  - **`crates/core/boot/fat32.asm`** (§6): a one-sector FAT32 VBR that loads BOOTMGR. Cases
-    16-20: tidy, hostile (label spelled BOOTMGR, a deleted entry, a near miss, a long-name
-    part, root directory across three clusters, 925 scattered clusters), 32 KiB clusters,
-    missing file, a 1.2 MB file that must stop loading short of the EBDA. The **real Windows 11
-    `bootmgr`** loaded by it reaches "Windows Boot Manager … \Boot\BCD … 0xc000000f", the
-    right complaint on a volume with no BCD. **Never on real hardware.**
-  - **Tauri 2.12** (tauri 2.12.5, plugins 2.8.3 / 2.7.2, `@tauri-apps/*` 2.12.4, vite 8.3.5):
-    `tauri build --no-bundle` passes and the binary runs under Xvfb with `GDK_BACKEND=x11`.
-    Closes GHSA-w28w-mhc8-qvjv (tauri ≤ 2.11.5, high, invisible to `cargo audit`) and the
-    three vite alerts.
-- **Written, not wired:** nothing in Rust references `mbr.bin` or `fat32.bin`; `buildable()`
-  still refuses every BIOS target. That is §6 step 3, and it is the next real work.
-- **Do first, in this order** (each small):
-  1. **Clear the seven open Dependabot PRs** (§8 has the triage of each; all green on their
-     own CI as of 2026-11-12). #31 and #33 are one Tauri-plugin pair and land together.
-     Four of them touch the workspace `Cargo.lock`, so merging one conflicts the rest —
-     either let Dependabot rebase each in turn, or do the four as one local
-     `cargo update --precise` commit and close the PRs as superseded (§8 says how).
-  2. **Add `timeout-minutes` to every CI job** (§8, "CI's `gui` job can hang"). Ten lines.
-  3. **§6 step 3**: wire both boot binaries into the flasher and open the BIOS gate.
-- **Before trusting this section:** `git fetch`, `gh run list` (CI *and* Security), `gh pr list`.
+  - `cargo audit` on both lockfiles: no vulnerabilities. The app's remaining warnings are the
+    accepted glib advisory and four unmaintained crates with no release to move to (§8).
+  - 137 tests and 23 selftest cases, every new one seen to fail on a copy of the tree with
+    one bug put in (§6 has the account, including two tests and one selftest case that were
+    vacuous until a mutation showed it).
+  - **Windows 11 25H2 boots to Setup's "Select language settings" under SeaBIOS** from media
+    built the flasher's way (§6, with the recipe to repeat it, no root needed).
+  - A fresh clone at `bb63f7c` passes fmt, clippy, tests and the selftest, and `d76d7f5`
+    builds and passes on its own.
+- **Written, not verified:** the device-side half of the BIOS path — writing through
+  `/dev/sdX` and `-part1`, unmounting an automounter's mount, the strict cache drop on a real
+  block device — has never run: no root here. Nothing BIOS has met real firmware.
+- **Do first:** the first real-hardware BIOS boot: a local session, a stick targeted by its
+  `/dev/disk/by-id` path, and explicit go-ahead before anything is written (§6, "The next
+  action").
+- **Then:** MBR + UEFI under OVMF, to open BIOS-or-UEFI; a BIOS target in the GUI (§8); the
+  §7 backlog.
+- **Before trusting this section:** `git fetch`, `gh run list` (CI *and* Security),
+  `gh pr list`, and `gh auth status` — on 2026-11-12 the stored `gh` token went invalid
+  mid-session and the push waited on a re-login.
 
 ## 1. What this is
 
@@ -98,16 +99,24 @@ crates/core/src/blockio.rs  streaming I/O: progress, SHA-256, verification,
 crates/core/src/format.rs   format options: scheme/target/filesystem/cluster/label,
                             and the rules that make an illegal combination unusable
 crates/core/src/lzw.rs      streaming Unix compress (.Z) decoder
+crates/core/src/bootcode.rs the BIOS boot code (mbr.bin, fat32.bin, embedded) and its
+                            installer: checks a disk the way the BIOS reads it, then
+                            writes the VBR, its backup, and the MBR's 440 bytes
+crates/core/examples/install_bios_boot.rs
+                            that installer pointed at a disk image, for the harness
 crates/core/fixtures/       real binary test archives, with a README on provenance
 crates/core/boot/mbr.asm    the MBR: chainloads the active partition (LBA, CHS from the
                             BIOS geometry, a bounded DL retry); mbr.bin beside it is what
-                            it assembles to, checked by the selftest and CI
+                            it assembles to, checked by the selftest and CI, and what
+                            bootcode.rs embeds
 crates/core/boot/fat32.asm  the FAT32 volume boot record: finds and loads BOOTMGR in one
                             sector; fat32.bin likewise
 docs/research/              research notes that outlive a session (the Rufus survey)
 crates/cli/src/main.rs      `sirius-flash list | write | unattend`
 scripts/boottest.py         boot-test harness: build media in a plain file,
-                            install boot code, boot it under qemu, read the screen
+                            install boot code (its own installer, or core's with
+                            `install`), boot it under qemu, read the screen — or,
+                            with `run --kvm --screendump`, photograph a graphical one
 scripts/boot/marker.asm     a known-good MBR, so the harness can prove it
                             detects a working boot sector as well as a dead one
 scripts/boot/marker_vbr.asm a VBR that checks the MBR's handover contract and
@@ -134,10 +143,11 @@ Cargo workspace **excludes** `app/` (the Tauri app has its own lockfile; CI audi
       detected by content, streamed, and decoded through **every** stream of a
       concatenated archive; a zip member's CRC-32 is verified like every other format's
       own checksum, and a damaged image member is refused rather than replaced by a sibling
-- [x] BIOS boot sectors, written here and boot-tested under qemu: an MBR that chainloads
-      the active partition (LBA, CHS from the BIOS geometry, a bounded DL retry) and a
-      one-sector FAT32 VBR that loads the real Windows 11 `bootmgr` — **not yet wired into
-      the flasher** (§6 step 3)
+- [x] BIOS boot: an MBR that chainloads the active partition (LBA, CHS from the BIOS
+      geometry, a bounded DL retry) and a one-sector FAT32 VBR that loads BOOTMGR, both
+      written here and installed by `bootcode.rs` for MBR + BIOS + FAT32 (`--target bios`).
+      Media built the flasher's way boots the real Windows 11 Setup under SeaBIOS —
+      **never on real hardware** (§6)
 - [x] Recursive tree copy in-process, no `rsync`
 - [x] Windows 11 User Experience: bypass TPM / Secure Boot / RAM / CPU / storage
       (5 bypasses; Rufus offers 3 — and removed its storage one as "a bogus bypass that
@@ -149,9 +159,10 @@ Cargo workspace **excludes** `app/` (the Tauri app has its own lockfile; CI audi
 - [x] CI green on Ubuntu / macOS / Windows: fmt, `clippy -D warnings`, tests, release build
 - [x] Security: `cargo audit` on both lockfiles, Dependabot, secret scanning, push protection
 
-**113 tests** (24 in `lib.rs`, 47 in `blockio.rs`, 12 in `lzw.rs`, 25 in `format.rs`,
-5 in the CLI); **98 of 108 passed on a non-Linux target** when last measured, before the
-five zip tests were added — that count is the working proxy
+**137 tests** (31 in `lib.rs`, 47 in `blockio.rs`, 11 in `bootcode.rs`, 12 in `lzw.rs`,
+28 in `format.rs`, 8 in the CLI); **121 of 137 run on a non-Linux target**, measured
+2026-11-12 — every installer test among them, since `bootcode.rs` has no platform code.
+That count is the working proxy
 for how much of the core is ready for the macOS backend, and it is measured, not estimated:
 copy the tree, `sed` the `target_os` guards, and run the suite (see §9).
 
@@ -232,6 +243,10 @@ data-loss or dead-stick regression.
 - Commits are Conventional Commits (`feat(core):`, `chore(security):`, …).
 - Rufus is GPL-3.0 and so are we — studying and adapting it is legal, and credited in
   `README.md`. Keep crediting it.
+- **An expectation is never computed by the code it checks.** The mutation sweep of the
+  BIOS installer found two tests that built their expected value with the module's own
+  constant (`BPB_END`) or predicate (`has_bios_boot_record`); the bug moved the expectation
+  along with it and both stayed green. Use literal values, or state the fact itself.
 - **Boot code: seen to fail before believed.** A new selftest case is not trusted until it
   has gone red on a copy of the tree with one bug put in; the repo's sources are never
   edited to do it. Test-only paths are reached through assemble-time symbols (`-D`), the
@@ -361,15 +376,15 @@ it the warning is worthless.
 `uefi-ntfs.img` is vendored in `crates/core/assets/` because it cannot be built: its value
 is a Microsoft signature. Pinned by SHA-256 and checked in the preflight *and* at the write.
 
-### Boot sectors — MBR and FAT32 VBR written and boot-tested; wiring is next
+### Boot sectors — wired into the flasher; real hardware is next
 
 Both sectors exist, assemble reproducibly (nasm 2.16.01 in an Ubuntu 24.04 container and
 nasm 3.02 here agree byte for byte, at the default optimisation level), and are committed
 as binaries beside their sources — `mbr.bin` (440 bytes, 421 used) and `fat32.bin` (512
 bytes, 416 of the 420 code bytes used) — so that core can `include_bytes!` them without
 putting an assembler on the macOS and Windows build path. The selftest and a CI step both
-reassemble and compare; a stale binary fails the build. Nothing in Rust references either
-yet, and `buildable()` still refuses every BIOS target.
+reassemble and compare; a stale binary fails the build. `bootcode.rs` embeds both, and
+since 2026-11-12 the flasher installs them (step 3, below).
 
 **The harness grew to 20 cases.** `boot_and_read` takes several expected strings and a
 `floppy` mode (the image as drive A, no hard disk at all); `put` can scatter a file's
@@ -465,19 +480,127 @@ It also showed that the load cap only has a visible effect once the segment wrap
 into video memory and ROM below 1 MiB do not stick — which is why case 20's file is 1.2 MB
 and not 600 KB.
 
-**The next action: step 3, wire both into the flasher and open the gate.** What the
-installer must do, all of it already enforced by `boottest.py vbr` and worth copying
-field-for-field: refuse a volume whose bytes-per-sector is not 512 or whose hidden-sectors
-field is not the partition's start LBA; splice bytes 0x0B-0x59 of the formatted volume into
-`fat32.bin` and write the result to the partition's first sector **and** to the backup at
-`BkBootSec` (sector 6 under `mkfs.fat`; a stale backup makes every `fsck` report
-differences and a repair restores the old code); write `mbr.bin` as 440 bytes so the disk
-identifier and the partition table survive; mark exactly one partition active, type 0x0C.
-`format.rs:323` `buildable()` is the single place that refuses BIOS, and its message names
-the reason — it must stop being true before it stops being returned. Then the first real
-hardware boot: everything above ran under SeaBIOS on an emulated IDE disk, and the
-assumptions that only real firmware can test are DL, AH=08h geometry on USB-HDD emulation,
-and whether any BIOS still lacks packet reads.
+**Step 3, done 2026-11-12: wired, and the gate opened for MBR + BIOS + FAT32.**
+`crates/core/src/bootcode.rs` holds both binaries — a wrong length does not compile, and a
+`fat32.bin` without its short jump, its zeroed 0x0B-0x59 or its 0x55AA fails a const
+assertion — and the installer, split so the checks cannot be skipped: `prepare` only reads
+and is the only way to get a `Prepared`, and only a `Prepared` writes. It enforces what
+`mbr.asm` and `fat32.asm` assume: every status byte 0x00 or 0x80, exactly one active entry,
+type 0x0C, not at LBA 0, inside the disk; a 0x55AA'd FAT32 volume (the `"FAT32   "` string,
+no FAT16 fields) with 512-byte sectors, hidden sectors equal to the partition start, a
+power-of-two cluster size (zero would make the loader read 65,535 sectors per cluster), at
+least one FAT, at least 65,525 clusters, a root cluster on the volume, the first FAT live
+(`BPB_ExtFlags`, since the loader reads FAT 0 only), the whole volume below LBA 2^32 (the
+loader's LBAs are 32-bit), and a backup boot sector that is a free reserved sector and agrees
+with the primary. Then it splices 0x0B-0x59, writes the primary and the backup, writes the
+MBR as 440 bytes, and reads all three back.
+
+The flasher, for MBR + BIOS: before anything destructive the ISO must have `\bootmgr`,
+`\boot\bcd`, and a BOOTMGR no larger than the VBR loads whole (`BOOTMGR_MAX`, 520,192
+bytes, the 0x20000-0x9F000 window; Windows 11's is 473,364); the layout is fat32-split
+whatever the image size (`default_for_target`), FAT32 being the one filesystem with a boot
+record here. Then `sfdisk` writes one active 0x0C partition at 1 MiB, and the old boot code
+is cleared: `sfdisk` keeps the first 440 bytes of whatever was there, so a re-flashed BIOS
+stick would keep its old loader. `mkfs.fat` gets `-h 2048` explicitly. Any mount of the new
+volume — a desktop automounter mounts a fresh FAT volume as readily as we do — is found in
+`/proc/self/mountinfo` and undone, or the run stops and names it. `install_vbr` drops the
+disk's page cache (a failed drop is an error now: a read-back that checks RAM proves
+nothing), runs `prepare` through the whole disk (the BIOS's view), checks sysfs agrees that
+`-part1` starts where the table says, and writes the VBR **through the partition device**.
+The copy follows. After our unmount and anyone else's, `install_mbr_and_verify` reads the
+boot records back from the device, then writes the MBR's 440 bytes **last** and reads
+sector 0 back.
+
+Why those devices and that order: `/dev/sdX` and `/dev/sdX1` have separate page caches, and
+the kernel's FAT driver rewrites sector 0 on every mount and unmount from the partition's
+cached copy (its dirty flag, byte 0x41: 0x00 after mkfs, 0x01 while mounted, 0x00 after
+unmount — observed through a loop mount), so a VBR written through the whole disk while
+anything held a stale copy would be put back by the next unmount. Closing a written whole
+disk makes udev re-read its table, and an automounter may mount the volume again as it
+reappears — setting the dirty flag in the very sector being checked — so the boot records
+are read back before that write, and the MBR, which no FAT driver touches, after it. Until
+that last write the stick has no boot code at all, so a copy that failed never starts.
+`sfdisk` erases both GPT headers when it relabels a stick that held our UEFI layout
+(observed), so no stale GPT survives the switch.
+
+The CLI has `--target uefi|bios` (the scheme follows: GPT cannot boot a BIOS) and asks the
+same validate + `buildable()` the core does before the YES prompt; with BIOS + Windows and
+without the Secure Boot and TPM bypasses it says Windows 11 Setup will refuse the machine;
+and options that cannot act on the image — format flags or tweaks on a raw image,
+`--no-verify` on Windows media — are refused by name (invariant 13). The GUI has no target
+selector yet. Still refused by `buildable()`: BIOS + NTFS or exFAT (no boot record), 4Kn
+(the boot code is 512-byte only), and MBR + UEFI or BIOS-or-UEFI (the UEFI half has never
+been booted here; the harness is SeaBIOS only).
+
+**Verified, by observation, on image files:**
+
+- 11 installer unit tests on real `sfdisk`/`mkfs.fat` output (`fixtures/bios-fat32-head.bin`,
+  reproducible byte for byte), Linux tests that run the flasher's own partition script and
+  `mkfs.fat` arguments on a 2 GiB file and need `fsck.fat` silent about the boot sectors, and
+  gate and CLI tests. Every one was seen to fail on a copy of the tree with one bug put in: a
+  46-mutation sweep, four more on the CLI's misplaced-option check, seven on what the review
+  added, and two on case 23. The sweep caught two tests computing their expectation through
+  the code under test (§5); both now fail as they should.
+- Selftest case 21: the Rust installer and the harness's Python one (of which it is a port)
+  write identical images, the Rust one refuses hidden sectors one short without writing, and
+  the result boots the stand-in and passes `fsck.fat`. Case 22: 64 KiB clusters, the largest a
+  FAT32 plan picks and never booted before, boot; `movsx` for `movzx` in `fat32.asm` breaks
+  case 22 and nothing else. Case 23 ties `BOOTMGR_MAX` to `fat32.asm`: asked of the Rust
+  binary, a BOOTMGR of exactly that size loads whole, and one that spills eight bytes into the
+  next sector stops at sector 0x3F8. Raising the Rust constant alone fails it, and so does
+  raising `fat32.asm`'s cap alone — each seen on a copy with its own cargo target directory.
+  The spill is eight bytes, not one, because the stand-in's last sector must hold its number
+  and its "END!" tail; with one byte it reports itself bad loaded or not, which made the first
+  version of this case vacuous (the raised cap passed it). `stand_in` now refuses such sizes.
+- **Windows 11 25H2, end to end under SeaBIOS (KVM):** a 10 GiB image built step for step
+  as the flasher builds it — the same table, `mkfs.fat` with the plan's 8 KiB clusters and
+  `-h 2048`, the ISO tree copied through the kernel's vfat (a udisks loop mount),
+  `install.wim` split by the flasher's own `wimlib-imagex split … 3800` into three `.swm`,
+  boot code by the Rust installer — boots through our MBR, our VBR, the real `bootmgr`, BCD
+  and `boot.wim` to Setup's "Select language settings". Without `install.wim` on the stick,
+  25H2 Setup stops at "A media driver your computer needs is missing"; worth knowing if a real
+  stick ever shows it.
+
+**The adversarial review** found no defect in the boot-sector logic or the gate, and four
+things that would have shipped, all fixed with a test seen to fail: `sfdisk` keeping a
+re-flashed stick's old boot code, so a failed copy left an old loader in front of half an
+installer (now cleared after partitioning); an automounter's second mount defeating the
+unmount check and failing the read-back for a reason it would not name (now every mount is
+found and undone, or named); a CLI test that re-implemented the check it claimed to guard
+(the check is now the one function `main` calls); and a cache drop whose failure was
+ignored, a flaw the shipped raw-image read-back shared (now an error on a block device).
+Smaller: the stand-in builder's off-by-one at exact multiples of 512, which case 23 needed;
+the BIOS caveat's text moved into core (invariant 14); an unreadable logical block size no
+longer taken for 512; and this file's old claim that `mkfs.fat` builds a sub-floor FAT32
+volume silently, corrected below. It also ran the flasher's partition script and `mkfs.fat`
+arguments for drives of 2 to 512 GiB at every FAT32 cluster size the plan offers: all 52
+installed.
+
+**Not verified:** the device-side half — `install_vbr`, `unmount_everywhere` and
+`install_mbr_and_verify` against a real block device, with its page caches, udev, an
+automounter and `blockdev --flushbufs` — has never run; it needs root and a stick. Nor has
+anything met real firmware: DL, AH=08h geometry under USB-HDD emulation, packet reads.
+
+**The next action: the first real-hardware boot.** A local session, a stick targeted by its
+`/dev/disk/by-id` path, and explicit go-ahead before anything is written:
+`sudo sirius-flash write --iso <Win11.iso> --device /dev/disk/by-id/usb-… --target bios
+--bypass-all`, then boot a machine in legacy/CSM mode. The same stick in UEFI mode is the
+first data point for opening MBR + UEFI (it carries `\EFI\BOOT\BOOTX64.EFI` too).
+
+To repeat the Windows run without hardware (no root; `/dev/kvm` and udisks2):
+
+```bash
+./scripts/boottest.py build win.img --size-mib 10240 --label WIN11USB --sec-per-clus 16
+7z x Win11.iso -oiso '-x!sources/install.wim'      # everything but the 7 GB image
+udisksctl loop-setup -f win.img                     # p1 auto-mounts at /run/media/$USER/WIN11USB
+udisksctl loop-setup -r -f Win11.iso                # read-only; auto-mounts by its UDF label
+cp -r iso/. /run/media/$USER/WIN11USB/
+wimlib-imagex split /run/media/$USER/<ISO label>/sources/install.wim \
+  /run/media/$USER/WIN11USB/sources/install.swm 3800
+udisksctl unmount -b /dev/loopNp1; udisksctl unmount -b /dev/loopM   # loops clear themselves
+./scripts/boottest.py install win.img
+./scripts/boottest.py run win.img --kvm --memory 4096 --timeout 240 --screendump setup.png
+```
 
 ### The Rufus source: where it is and how to read it
 
@@ -562,7 +685,7 @@ greppable; no screenshots.
 
 **This is built: `scripts/boottest.py`.** `build` makes the media, `mbr` and `vbr` install
 boot code, `put` writes a file into the FAT32 volume, `run` boots it and prints the screen.
-`selftest` runs the whole thing in about eight seconds and is a `boot` job in CI.
+`selftest` runs the whole thing in about a minute and is a `boot` job in CI.
 
 The selftest is a **negative** test before it is a positive one. It asserts that media with
 no boot code is reported as dead — SeaBIOS reaches `Booting from Hard Disk...` and then
@@ -579,8 +702,11 @@ Five traps, each of which silently produces media that looks fine:
 - **`BLOCK-COUNT` is in 1024-byte blocks, not sectors.** Passing the sector count builds a
   filesystem twice the size of its partition, which mounts happily until something reads
   past the end.
-- **`mkfs.fat -F 32` will build a volume below FAT32's 65525-cluster floor** without saying
-  so; only `fsck.fat` mentions it afterwards. Hence a 512 MiB default and an explicit check.
+- **`mkfs.fat -F 32` will build a volume below FAT32's 65525-cluster floor** with no more
+  than a warning on stderr ("Number of clusters for 32 bit FAT is less then suggested
+  minimum") and exit status 0, so nothing that checks the exit status notices. Hence a
+  512 MiB default and an explicit check. (Corrected 2026-11-12: this said "without saying
+  so" until the review of the BIOS installer ran it.)
 - **qemu's `memsave` rejects an absolute path**, because the HMP parser reads a leading `/`
   as a format specifier: it fails with `invalid char 't' in expression`, writes nothing, and
   leaves qemu's exit status untouched. The harness runs qemu with its cwd set and passes a
@@ -602,7 +728,8 @@ rather than being copied verbatim.
 
 ## 7. Backlog after that
 
-Wire the boot sectors (§6 step 3) · Built-in ISO downloader (Linux catalogue first, then
+First real-hardware BIOS boot (§6) · MBR + UEFI and BIOS-or-UEFI boot-verified under OVMF,
+so `buildable()` can open them · a BIOS target in the GUI · Built-in ISO downloader (Linux catalogue first, then
 Windows) · macOS backend · Windows backend · signed CI releases → `dl.siriuside.com` +
 AUR · persistent-partition support · bad-block check.
 
@@ -623,41 +750,17 @@ hybrid ISOs, and the legacy/packer tail.
 
 ## 8. Open items
 
-- **Dependabot, as of 2026-11-12: seven PRs open, all green on their own CI, none merged.**
-  Re-check with `gh pr list`; Dependabot rebases and re-numbers. Triage, so nobody re-reads
-  the release notes:
-  - **#31 + #33 — `tauri-plugin-dialog` / `@tauri-apps/plugin-dialog` 2.8.3 → 2.8.4.** The
-    first PRs from the Dependabot `groups` added on 10-22, and they arrived exactly as
-    intended: one per side. **Merge both, together.** A patch-level mismatch would not trip
-    `tauri build`'s major.minor check, but keep the pair moving as one so a later minor bump
-    cannot strand one side. No new advisories in `tauri-apps/tauri` or
-    `tauri-apps/plugins-workspace` since 2026-10-01, checked per `SECURITY.md`.
-  - **#35 — `zip` 9.0.5 → 9.4.1.** `Cargo.lock` only (the manifest says `"9"`). The core of
-    this session's zip work — the `ArchiveOffset::Known(0)` open, the CRC-32 check, the
-    damaged-header refusal — is covered by unit tests, and they all pass on the PR's CI,
-    including the test that meters bytes read to open a 4 MiB archive (the guard against
-    zip 9 scanning the whole file). What changed upstream: 9.2.0 added a multi-threaded
-    extraction engine and an index-free iterable reader, neither of which we call; under our
-    `default-features = false, features = ["deflate-flate2"]` zip now also pulls `getrandom`
-    and `libc` as normal dependencies and moves `typed-path` to 0.13. The `wasm-bindgen`
-    family it adds to the lockfile is built only for `wasm32` — checked with `cargo tree -i
-    wasm-bindgen --target` on Linux, macOS and Windows targets: absent. The ~7,000-archive
-    behavioural corpus from 10-22 did not survive (scratch), so the only behavioural evidence
-    is the unit tests; reasonable to merge on that.
-  - **#28 — `liblzma` 0.4.8 → 0.4.9** (bumps the bundled, statically built xz to 5.8.4).
-    Opened 10-22 against `5f17de3`; its green checks predate the later merges, so rebase
-    (`@dependabot rebase`) and merge on the fresh run.
-  - **#34 — `crc32fast` 1.5.2 → 1.5.4** (now a direct dependency, for the zip CRC check),
-    **#37 — `flate2` 1.1.10 → 1.1.11**: routine patch bumps, `Cargo.lock` only.
-  - **#36 — `vite` 8.3.5 → 8.3.6** in `/app`: routine; touches `package.json` and the lockfile.
-  - **#28, #34, #35, #37 all edit the workspace `Cargo.lock`**, so the first merge conflicts
-    the other three. Two ways through: merge one, `@dependabot rebase` the next, wait for
-    green, repeat (four CI cycles, ~15 min each); or one local commit — one `cargo update -p
-    <crate> --precise <version>` per crate (liblzma 0.4.9, crc32fast 1.5.4, zip 9.4.1,
-    flate2 1.1.11), then the same four in `app/src-tauri` so the app's lockfile matches (it links
-    them through `sirius-flash-core`, and `cargo audit --file` only sees what it lists), run
-    the pre-push checks, push, and close the four PRs by hand with a comment naming the
-    commit. GitHub does not close a PR when a different commit makes the same change.
+- **Dependabot, as of 2026-11-12 (second session): cleared.** #33 + #31 (the Tauri dialog
+  pair) and #36 (vite) were rebase-merged on GitHub, in that order, which applies cleanly.
+  #28, #34, #35 and #37 all edit the workspace `Cargo.lock`, so merging any one conflicts the
+  rest: they became one local commit, `c6b249b`, with the same four versions mirrored into
+  `app/src-tauri/Cargo.lock` (which links them through `sirius-flash-core` and is what
+  `cargo audit --file` reads), and were closed by hand naming it — GitHub does not close a
+  PR that another commit supersedes. Correction to the old triage: #28 bumped only the
+  `liblzma` wrapper (0.4.9 drops `num_cpus`); `liblzma-sys` 0.4.9 with xz 5.8.4 was already
+  locked. The pattern that works: merge PRs whose files are disjoint, fold same-lockfile bumps
+  into one `cargo update -p <crate> --precise <version>` commit across both lockfiles, close
+  the rest by hand.
   - **History (2026-10-22), kept for the pattern:** a 17-PR backlog was cleared — two closed
     as superseded by `80c0155` (#24, #25), eleven by `5f17de3` (the Tauri family could not be
     merged piecemeal), five rebased and merged (#23, #5, #9, #10, #29), and the app's
@@ -683,14 +786,18 @@ hybrid ISOs, and the legacy/packer tail.
   nothing is worse than none. Also untested on a real install: our `autounattend.xml` at the
   media root (Rufus puts it inside `boot.wim` index 2 or under `sources\$OEM$\$$\Panther`,
   and patches the bypass into the offline registry to avoid a command window during Setup).
-- **CI's `gui` job can hang for six hours in `apt-get`.** On the final push of 2026-10-22 its
-  "GUI system dependencies" step hung from 16:06 to 22:07 UTC until GitHub's job limit
-  cancelled the run; a rerun of the job was green in ten minutes, and the commit was
-  docs-only. Nothing in `ci.yml` sets `timeout-minutes`, so a stalled mirror costs six hours
-  and a red run. Cheap fix for the class: `timeout-minutes` on each job (`gui` normally
-  takes ~10 min, `check` ~6, `boot` ~2), and `apt-get -o Acquire::Retries=3`.
 - `RUSTSEC-2024-0429` (`glib`) is accepted and documented in `SECURITY.md`; it arrives via
   Tauri's GTK stack and has no fixed version reachable from here. Still true at tauri 2.12.5.
+  It is also GitHub's Dependabot alert #1 (GHSA-wrw7-89jp-8q8g, open since 2026-09-14),
+  which is the "1 moderate vulnerability" every push to `main` prints — not a new finding.
+- **The app's audit warnings, as of 2026-11-12.** Security fails on vulnerabilities only, so
+  warnings pile up unseen. `0f8fd2c` took the fixed releases for tokio (RUSTSEC-2026-0386)
+  and rustix (RUSTSEC-2026-0486) and replaced a yanked async-executor. Left, with no release
+  to move to: `zbus_names`, `zvariant`, `zvariant_derive` (RUSTSEC-2026-0371/0370/0372,
+  unmaintained, via `zbus` <- `tauri-plugin-opener`) and `proc-macro-error`
+  (RUSTSEC-2024-0370, via `glib-macros`, the same gtk 0.18 stack as glib). `SECURITY.md`
+  documents only glib; whether to list these there is open. Re-check with
+  `cargo audit --file app/src-tauri/Cargo.lock` on every app lockfile change.
 - **The Tauri app was invisible to CI, and that had already cost something.** It is
   excluded from the Cargo workspace, so `cargo clippy --workspace` and `cargo build
   --workspace --release` both exit 0 with a hard type error in `app/src-tauri/src/lib.rs`
@@ -708,6 +815,9 @@ hybrid ISOs, and the legacy/packer tail.
   dialog states the trigger ("if this image holds a file larger than 4 GB") rather than the
   outcome. The in-process ISO reader in §7 is the real fix; `7z l` is the stopgap, and that
   wants testing against a real Windows ISO.
+- **The GUI cannot make BIOS media.** `--target bios` is CLI-only; the GUI has no target
+  selector. When it gets one, its confirm dialog must show `WindowsTweaks::bios_caveat()`
+  and the misplaced-option rule must hold there too (invariants 13 and 14).
 - A USB serial and a home path remain in commit `8b95dda`. Deliberately **not** rewritten:
   they are not credentials, and GitHub keeps force-pushed commits reachable by SHA, so a
   rewrite would not remove them. The real remediation — enabling secret scanning, push
@@ -717,10 +827,10 @@ hybrid ISOs, and the legacy/packer tail.
 
 ```bash
 cargo build --release                       # core + CLI
-cargo test --workspace                      # 113 tests
+cargo test --workspace                      # 137 tests
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 cd app && pnpm install && pnpm tauri dev    # GUI
-./scripts/boottest.py selftest              # 20 boot cases under qemu, ~55 s
+./scripts/boottest.py selftest              # 23 boot cases under qemu, about a minute
 ```
 
 CI mirrors exactly that across the three-OS matrix. `cargo fmt --check` runs first, so an
